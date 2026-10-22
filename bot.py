@@ -29,14 +29,15 @@ TOKEN = os.environ.get("BOT_TOKEN")
 DB = "monitor.db"
 TZ = ZoneInfo("Asia/Riyadh")
 
-# States
-(EXP_AMOUNT, EXP_CAT, EXP_PTYPE, EXP_CREDITOR, EXP_DUE, 
+# Conversation States
+(EXP_AMOUNT, EXP_CAT, EXP_PTYPE, EXP_VENDOR, EXP_DUE, 
  INC_AMOUNT, INC_SOURCE, 
  RATE_INPUT, LIMIT_INPUT,
- SD_ADD_NAME, SD_ADD_AMT, SD_EDIT_AMT, SD_PAY_AMT,
- LD_ADD_NAME, LD_ADD_AMT, LD_EDIT_AMT, LD_PAY_AMT,
- PAY_CREDITOR_AMT, PAY_CREDITOR_TYPE,
- ROLLOVER_CASH) = range(20)
+ CIG_TYPE, CIG_VENDOR,
+ VENDOR_ADD_NAME,
+ LD_ADD_NAME, LD_ADD_AMT, LD_ADD_INSTALLMENT,
+ PAY_DEBT_AMT, 
+ ROLLOVER_CASH) = range(17)
 
 def now():
     return datetime.now(TZ)
@@ -56,20 +57,19 @@ def db():
 def init():
     with db() as c:
         c.executescript("""
-        CREATE TABLE IF NOT EXISTS cigarettes(id INTEGER PRIMARY KEY, ts TEXT);
-        CREATE TABLE IF NOT EXISTS creditors(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
+        CREATE TABLE IF NOT EXISTS cigarettes(id INTEGER PRIMARY KEY, ts TEXT, cig_type TEXT, cost REAL, vendor_id INTEGER);
+        CREATE TABLE IF NOT EXISTS vendors(id INTEGER PRIMARY KEY, name TEXT UNIQUE);
         CREATE TABLE IF NOT EXISTS expenses(
             id INTEGER PRIMARY KEY, ts TEXT, amount REAL, category TEXT,
-            ptype TEXT, creditor_id INTEGER, due_date TEXT, paid INTEGER DEFAULT 0);
+            ptype TEXT, vendor_id INTEGER, due_date TEXT, paid INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS prayers(date TEXT, name TEXT, status INTEGER, PRIMARY KEY(date, name));
         CREATE TABLE IF NOT EXISTS incomes(id INTEGER PRIMARY KEY, ts TEXT, amount REAL, source TEXT);
         CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
-        CREATE TABLE IF NOT EXISTS sudan_reqs(name TEXT PRIMARY KEY, amount_sdg REAL);
-        CREATE TABLE IF NOT EXISTS sudan_pays(id INTEGER PRIMARY KEY, ts TEXT, name TEXT, paid_sdg REAL, paid_sar REAL);
-        CREATE TABLE IF NOT EXISTS long_debts(id INTEGER PRIMARY KEY, name TEXT, total_sar REAL, paid_sar REAL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS long_debts(id INTEGER PRIMARY KEY, name TEXT, total_sar REAL, installment_sar REAL, paid_sar REAL DEFAULT 0);
         """)
         c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES('exchange_rate', '140')")
         c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES('daily_target', '15')")
+        c.execute("INSERT OR IGNORE INTO settings(key, value) VALUES('cig_price', '1.0')")
 
 def get_setting(key, default=None):
     with db() as c:
@@ -78,9 +78,9 @@ def get_setting(key, default=None):
 
 def get_rate(): return get_setting('exchange_rate', 140.0)
 def get_daily_target(): return int(get_setting('daily_target', 15.0))
+def get_cig_price(): return get_setting('cig_price', 1.0)
 
 def get_next_cig_time():
-    # خوارزمية التدخين الذكية
     t = now()
     target = get_daily_target()
     today_str = t.strftime("%Y-%m-%d")
@@ -89,43 +89,40 @@ def get_next_cig_time():
         smoked = c.execute("SELECT COUNT(*) c FROM cigarettes WHERE ts LIKE ?", (f"{today_str}%",)).fetchone()["c"]
     
     remaining = max(0, target - smoked)
-    if remaining <= 1:
-        return "توقفت لهذا اليوم"
+    if remaining <= 1: return "انتهى السقف اليومي"
 
-    # تحديد أوقات اليقظة (بالتوقيت المحلي)
-    is_weekend = t.weekday() in (4, 5) # الجمعة والسبت
-    wake_time_1 = t.replace(hour=9, minute=0, second=0, microsecond=0) # نبدأ 9 لتجنب الريق
-    sleep_time_1 = t.replace(hour=14, minute=0, second=0, microsecond=0)
-    wake_time_2 = t.replace(hour=17, minute=0, second=0, microsecond=0)
-    sleep_time_2 = t.replace(hour=2, minute=0, second=0, microsecond=0) + timedelta(days=1)
-
-    current = t
+    # أوقات اليقظة: 8:30ص - 2:00م، و 5:00م - 2:00ص
+    wake_1 = t.replace(hour=8, minute=30, second=0, microsecond=0)
+    sleep_1 = t.replace(hour=14, minute=0, second=0, microsecond=0)
+    wake_2 = t.replace(hour=17, minute=0, second=0, microsecond=0)
+    sleep_2 = t.replace(hour=2, minute=0, second=0, microsecond=0) + timedelta(days=1)
     
-    # إذا كان الوقت قبل 9 صباحاً
-    if current < wake_time_1:
+    # أول سيجارة الساعة 9 ص لتجنب الريق
+    first_cig_time = t.replace(hour=9, minute=0, second=0, microsecond=0)
+    
+    current = t
+
+    if current < wake_1:
+        return "09:00 ص"
+    if current < first_cig_time and smoked == 0:
         return "09:00 ص"
     
-    # حساب الوقت المتبقي في فترة اليقظة الأولى
-    if wake_time_1 <= current < sleep_time_1:
-        rem_mins_1 = (sleep_time_1 - current).total_seconds() / 60
-        rem_mins_2 = (sleep_time_2 - wake_time_2).total_seconds() / 60
+    if wake_1 <= current < sleep_1:
+        rem_mins_1 = (sleep_1 - current).total_seconds() / 60
+        rem_mins_2 = (sleep_2 - wake_2).total_seconds() / 60
         total_awake_mins = rem_mins_1 + rem_mins_2
-    elif wake_time_2 <= current < sleep_time_2:
-        total_awake_mins = (sleep_time_2 - current).total_seconds() / 60
+    elif wake_2 <= current < sleep_2:
+        total_awake_mins = (sleep_2 - current).total_seconds() / 60
     else:
-        # في وقت النوم (القيلولة)
-        return "05:00 م"
+        return "05:00 م" # فترة النوم
 
-    # المعادلة: (إجمالي الوقت المتبقي من اليقظة) / (عدد السجائر المتبقية)
     gap = total_awake_mins / remaining
     next_time = current + timedelta(minutes=gap)
     
-    # إذا تخطى وقت النوم الأول
-    if next_time > sleep_time_1 and current < sleep_time_1:
-        next_time = wake_time_2
+    if sleep_1 <= next_time <= wake_2:
+        next_time = wake_2
         
-    # إذا تخطى وقت النوم الثاني
-    if next_time > sleep_time_2:
+    if next_time > sleep_2:
          return "غداً 09:00 ص"
 
     return next_time.strftime("%I:%M %p").replace("AM", "ص").replace("PM", "م")
@@ -140,9 +137,9 @@ def get_wallet_balance():
     with db() as c:
         inc = c.execute("SELECT COALESCE(SUM(amount),0) s FROM incomes").fetchone()["s"]
         exp = c.execute("SELECT COALESCE(SUM(amount),0) s FROM expenses WHERE ptype='cash'").fetchone()["s"]
-        sudan = c.execute("SELECT COALESCE(SUM(paid_sar),0) s FROM sudan_pays").fetchone()["s"]
-        long_paid = c.execute("SELECT COALESCE(SUM(paid_sar),0) s FROM long_debts").fetchone()["s"]
-    return inc - exp - sudan - long_paid
+        cigs_cash = c.execute("SELECT COALESCE(SUM(cost),0) s FROM cigarettes WHERE cig_type='cash'").fetchone()["s"]
+        ld_paid = c.execute("SELECT COALESCE(SUM(paid_sar),0) s FROM long_debts").fetchone()["s"]
+    return inc - exp - cigs_cash - ld_paid
 
 def get_prayers():
     today = now().date().isoformat()
@@ -174,36 +171,52 @@ def get_next_prayer_al_qurayyat():
         return "⏳ القادمة: الفجر (غداً)"
     except: return "⏳ تعذر جلب المواقيت"
 
-def get_expense_breakdown():
-    today_str = now().strftime("%Y-%m-%d")
+def get_debt_summary():
     with db() as c:
-        rows = c.execute("SELECT category, SUM(amount) as total FROM expenses WHERE ts LIKE ? GROUP BY category", (f"{today_str}%",)).fetchall()
-    if not rows: return "*(لا توجد مصاريف اليوم)*", 0
-    
-    rate = get_rate()
+        # قصيرة الأجل (غير مدفوعة)
+        short_term = c.execute("SELECT COALESCE(SUM(amount),0) s FROM expenses WHERE ptype='credit' AND paid=0").fetchone()["s"]
+        # طويلة الأجل (مجموع الأقساط المستحقة فقط)
+        long_term_installments = c.execute("SELECT COALESCE(SUM(installment_sar),0) s FROM long_debts WHERE total_sar > paid_sar").fetchone()["s"]
+        
+        # ديون السيجارة الآجلة
+        cig_debts = c.execute("SELECT COALESCE(SUM(cost),0) s FROM cigarettes WHERE cig_type='credit'").fetchone()["s"]
+        
+    return short_term + long_term_installments + cig_debts, short_term + cig_debts, long_term_installments
+
+def get_expense_breakdown(period="month"):
+    with db() as c:
+        if period == "month":
+            month_str = now().strftime("%Y-%m")
+            query = "SELECT category, SUM(amount) as total FROM expenses WHERE ts LIKE ? GROUP BY category"
+            rows = c.execute(query, (f"{month_str}%",)).fetchall()
+            cig_cash = c.execute("SELECT SUM(cost) s FROM cigarettes WHERE ts LIKE ? AND cig_type='cash'", (f"{month_str}%",)).fetchone()["s"] or 0
+        else:
+            rows = c.execute("SELECT category, SUM(amount) as total FROM expenses GROUP BY category").fetchall()
+            cig_cash = c.execute("SELECT SUM(cost) s FROM cigarettes WHERE cig_type='cash'").fetchone()["s"] or 0
+            
+    if rows:
+        rows = [dict(r) for r in rows]
+    else:
+        rows = []
+        
+    if cig_cash > 0:
+        found = False
+        for r in rows:
+            if r["category"] == "دخان":
+                r["total"] += cig_cash
+                found = True
+                break
+        if not found:
+            rows.append({"category": "دخان", "total": cig_cash})
+            
     total_sar = sum(r["total"] for r in rows)
+    if total_sar == 0: return "لا توجد بيانات.", 0
+    
     lines = []
     for r in sorted(rows, key=lambda x: x["total"], reverse=True):
-        lines.append(f"• {r['category']}: {r['total']:.0f} ر.س ({r['total']*rate:,.0f} ج.س) | {(r['total']/total_sar)*100:.0f}%")
+        pct = (r["total"] / total_sar) * 100
+        lines.append(f"• {r['category']}: {r['total']:.0f} ر.س | {pct:.0f}%")
     return "\n".join(lines), total_sar
-
-def get_cumulative_stats():
-    rate = get_rate()
-    with db() as c:
-        cigs_count = c.execute("SELECT COUNT(*) c FROM cigarettes").fetchone()["c"]
-        cig_manual = c.execute("SELECT SUM(amount) s FROM expenses WHERE category='دخان'").fetchone()["s"] or 0
-        smoke_tot = (cigs_count * 1.0) + cig_manual
-        grocery_tot = c.execute("SELECT SUM(amount) s FROM expenses WHERE category='بقالة'").fetchone()["s"] or 0
-        deferred_tot = c.execute("SELECT SUM(amount) s FROM expenses WHERE ptype='credit'").fetchone()["s"] or 0
-        sudan_tot = c.execute("SELECT SUM(paid_sar) s FROM sudan_pays").fetchone()["s"] or 0
-        other_tot = c.execute("SELECT SUM(amount) s FROM expenses WHERE ptype='cash' AND category NOT IN ('بقالة', 'تحويل السودان', 'سداد دين طويل')").fetchone()["s"] or 0
-
-    grand_total = smoke_tot + grocery_tot + sudan_tot + deferred_tot + other_tot
-    if grand_total == 0: return "*(لا توجد مصاريف تراكمية)*", 0
-
-    def add_row(name, amt): return f"• {name}: {amt:,.0f} ر.س ({amt*rate:,.0f} ج.س) | {(amt/grand_total)*100:.0f}%"
-    lines = [add_row("دخان", smoke_tot), add_row("بقالة", grocery_tot), add_row("أخرى", other_tot), add_row("ديون آجلة", deferred_tot), add_row("السودان", sudan_tot)]
-    return "\n".join(lines), grand_total
 
 def dashboard_text():
     ts = cigs_today(); target = get_daily_target()
@@ -212,124 +225,82 @@ def dashboard_text():
     next_cig = get_next_cig_time()
     wallet = get_wallet_balance()
     rate = get_rate()
-    breakdown_text, today_total = get_expense_breakdown()
-    cum_text, cum_total = get_cumulative_stats()
     
-    with db() as c:
-        sudan_req = c.execute("SELECT SUM(amount_sdg) s FROM sudan_reqs").fetchone()["s"] or 0
-        sudan_paid = c.execute("SELECT SUM(paid_sdg) s FROM sudan_pays").fetchone()["s"] or 0
-        sudan_rem_sar = (sudan_req - sudan_paid) / rate
-        long_total = c.execute("SELECT SUM(total_sar) s FROM long_debts").fetchone()["s"] or 0
-        long_paid = c.execute("SELECT SUM(paid_sar) s FROM long_debts").fetchone()["s"] or 0
-        long_rem_sar = long_total - long_paid
-        credit_tot = c.execute("SELECT SUM(amount) s FROM expenses WHERE ptype='credit' AND paid=0").fetchone()["s"] or 0
+    total_debt, short_debt, long_installments = get_debt_summary()
 
     prayers = get_prayers()
     p_icons = " ".join([f"{'✅' if v else '⬜'} {k}" for k, v in prayers.items()])
     next_prayer_text = get_next_prayer_al_qurayyat()
-    due_date = get_end_of_month()
 
     return (
         f"📅 *{now().strftime('%A %d %B %Y | %I:%M %p').replace('AM', 'ص').replace('PM', 'م')}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🚬 *رحلة الإقلاع عن التدخين:*\n"
-        f"🎯 السقف المستهدف: *{target} سيجارة*\n"
-        f"📊 المدخن اليوم: *{smoked}* | المتبقي: *{remaining}*\n"
-        f"⏰ السيجارة القادمة: *{next_cig}*\n"
-        f"🛡️ نسبة الالتزام: *{compliance_pct:.0f}%*\n\n"
-        f"📈 *المحفظة المالية:*\n"
-        f"💵 الرصيد المتاح: *{wallet:,.2f} ر.س*\n"
-        f"💱 سعر الصرف: *1 ر.س = {rate} ج.س*\n\n"
-        f"💰 *مصاريف اليوم:*\n"
-        f"💵 الإجمالي: *{today_total:.0f} ر.س ({today_total*rate:,.0f} ج.س)*\n"
-        f"{breakdown_text}\n\n"
+        f"💵 *المحفظة:* {wallet:,.2f} ر.س\n"
+        f"💱 *سعر الصرف:* 1 ر.س = {rate} ج.س\n"
+        f"📉 *إجمالي الالتزامات المستحقة:* {total_debt:,.0f} ر.س\n"
+        f"   _(قصيرة: {short_debt:,.0f} | قسط طويل: {long_installments:,.0f})_\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🚬 *التدخين اليوم:* {smoked} من {target}\n"
+        f"⏰ *القادمة:* {next_cig}\n"
+        f"🛡️ *الالتزام:* {compliance_pct:.0f}%\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"🕌 *الصلوات:*\n"
         f"{p_icons}\n"
-        f"{next_prayer_text}\n\n"
-        f"💼 *الالتزامات (استحقاق: {due_date}):*\n"
-        f"🇸🇩 السودان: *{sudan_rem_sar:,.0f} ر.س* ({(sudan_req-sudan_paid):,.0f} ج.س)\n"
-        f"⏳ طويلة الأجل: *{long_rem_sar:,.0f} ر.س* ({long_rem_sar*rate:,.0f} ج.س)\n"
-        f"📉 ديون آجلة: *{credit_tot:,.0f} ر.س* ({credit_tot*rate:,.0f} ج.س)\n\n"
-        f"📊 *التراكمي الكلي:*\n"
-        f"💵 الإجمالي: *{cum_total:,.0f} ر.س*\n"
-        f"{cum_text}\n"
+        f"{next_prayer_text}\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"🚀 رحلة النجاح مستمرة | *صالح محمد علي*"
     )
 
 def main_kb():
-    prayers = get_prayers()
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚬 سيجارة +1", callback_data="cig"), InlineKeyboardButton("⚙️ تعديل السقف", callback_data="edit_limit_btn")],
-        [InlineKeyboardButton("💰 إضافة مصروف", callback_data="add_exp_btn"), InlineKeyboardButton("➕ إضافة إيراد", callback_data="add_inc_btn")],
-        [InlineKeyboardButton("💼 إدارة الديون والمصاريف", callback_data="accrued_menu"), InlineKeyboardButton("📊 التقرير الشهري والترحيل", callback_data="monthly_report")],
-        [InlineKeyboardButton("💱 تعديل سعر الصرف", callback_data="edit_rate_btn"), InlineKeyboardButton("✏️ إدارة وتصحيح", callback_data="edit_menu")],
-        [InlineKeyboardButton(f"{'✅' if prayers['الفجر'] else '⬜'} الفجر", callback_data="pr|الفجر"), InlineKeyboardButton(f"{'✅' if prayers['الظهر'] else '⬜'} الظهر", callback_data="pr|الظهر"), InlineKeyboardButton(f"{'✅' if prayers['العصر'] else '⬜'} العصر", callback_data="pr|العصر")],
-        [InlineKeyboardButton(f"{'✅' if prayers['المغرب'] else '⬜'} المغرب", callback_data="pr|المغرب"), InlineKeyboardButton(f"{'✅' if prayers['العشاء'] else '⬜'} العشاء", callback_data="pr|العشاء")],
-        [InlineKeyboardButton("🔄 تحديث اللوحة", callback_data="refresh")],
+        [InlineKeyboardButton("🚬 سيجارة +1", callback_data="cig")],
+        [InlineKeyboardButton("💰 مصروف", callback_data="add_exp_btn"), InlineKeyboardButton("💵 إيداع راتب", callback_data="add_inc_btn")],
+        [InlineKeyboardButton("💼 إدارة الديون", callback_data="debt_menu"), InlineKeyboardButton("📊 التقارير", callback_data="report_menu")],
+        [InlineKeyboardButton("⚙️ الإعدادات", callback_data="settings_menu"), InlineKeyboardButton("🔄 تحديث", callback_data="refresh")],
     ])
 
-def accrued_menu_kb():
+def debt_menu_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📉 ديون الآجل (بقالة وأشخاص)", callback_data="menu_credit")],
-        [InlineKeyboardButton("⏳ ديون طويلة الأجل (أقساط)", callback_data="menu_long")],
-        [InlineKeyboardButton("🇸🇩 مستحقات السودان", callback_data="menu_sudan")],
-        [InlineKeyboardButton("🔙 رجوع للوحة", callback_data="refresh")]
+        [InlineKeyboardButton("📉 عرض الديون الحالية", callback_data="show_debts")],
+        [InlineKeyboardButton("💸 تسديد دين", callback_data="pay_debt_menu")],
+        [InlineKeyboardButton("➕ إضافة دين طويل الأجل", callback_data="add_long_debt")],
+        [InlineKeyboardButton("🏪 إدارة الجهات (بقالة/مطاعم)", callback_data="vendor_menu")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="refresh")]
     ])
 
-def monthly_report_kb():
+def report_menu_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔄 ترحيل للشهر القادم", callback_data="do_rollover")],
-        [InlineKeyboardButton("🔙 رجوع للوحة", callback_data="refresh")]
+        [InlineKeyboardButton("🧾 بيان المصروفات (هذا الشهر)", callback_data="rep_expenses_month")],
+        [InlineKeyboardButton("📈 التقرير الشهري الشامل", callback_data="rep_month")],
+        [InlineKeyboardButton("📉 تقرير الديون", callback_data="rep_debts")],
+        [InlineKeyboardButton("🚬 تقرير التدخين", callback_data="rep_cigs")],
+        [InlineKeyboardButton("🔄 ترحيل الرصيد للشهر القادم", callback_data="do_rollover")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="refresh")]
     ])
 
-def credit_menu_kb():
-    with db() as c:
-        rows = c.execute("SELECT c.id, c.name, SUM(e.amount) as total FROM expenses e JOIN creditors c ON c.id=e.creditor_id WHERE e.ptype='credit' AND e.paid=0 GROUP BY c.id").fetchall()
-    kb = []
-    if not rows: kb.append([InlineKeyboardButton("لا توجد ديون آجلة", callback_data="noop")])
-    for r in rows:
-        kb.append([InlineKeyboardButton(f"{r['name']} - متبقي {r['total']:.0f} ر.س", callback_data=f"pay_cred|{r['id']}")])
-    kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="accrued_menu")])
-    return InlineKeyboardMarkup(kb)
-
-def sudan_menu_kb():
-    rate = get_rate()
-    with db() as c:
-        sudan = c.execute("SELECT r.name, r.amount_sdg, COALESCE(p.paid_sdg,0) paid_sdg FROM sudan_reqs r LEFT JOIN (SELECT name, SUM(paid_sdg) paid_sdg FROM sudan_pays GROUP BY name) p ON r.name = p.name").fetchall()
-    kb = []
-    for r in sudan:
-        rem_sdg = r["amount_sdg"] - r["paid_sdg"]
-        kb.append([InlineKeyboardButton(f"👤 {r['name']} - {rem_sdg:,.0f} ج.س", callback_data="noop")])
-        kb.append([InlineKeyboardButton("💸 تحويل دفعة", callback_data=f"sd_pay|{r['name']}"), InlineKeyboardButton("✏️ تعديل", callback_data=f"sd_edit|{r['name']}"), InlineKeyboardButton("🗑️ حذف", callback_data=f"sd_del|{r['name']}")])
-    kb.append([InlineKeyboardButton("➕ إضافة مستفيد", callback_data="sd_add")])
-    kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="accrued_menu")])
-    return InlineKeyboardMarkup(kb)
-
-def long_menu_kb():
-    rate = get_rate()
-    with db() as c:
-        longs = c.execute("SELECT id, name, total_sar, paid_sar FROM long_debts").fetchall()
-    kb = []
-    for r in longs:
-        rem_sar = r["total_sar"] - r["paid_sar"]
-        kb.append([InlineKeyboardButton(f"🏦 {r['name']} - {rem_sar:,.0f} ر.س ({rem_sar*rate:,.0f} ج.س)", callback_data="noop")])
-        kb.append([InlineKeyboardButton("💸 سداد دفعة", callback_data=f"ld_pay|{r['id']}"), InlineKeyboardButton("✏️ تعديل", callback_data=f"ld_edit|{r['id']}"), InlineKeyboardButton("🗑️ حذف", callback_data=f"ld_del|{r['id']}")])
-    kb.append([InlineKeyboardButton("➕ إضافة دين جديد", callback_data="ld_add")])
-    kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="accrued_menu")])
-    return InlineKeyboardMarkup(kb)
-
-def edit_kb():
+def settings_menu_kb():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🗑️ حذف آخر سيجارة", callback_data="del_cig"), InlineKeyboardButton("🗑️ حذف آخر مصروف", callback_data="del_exp")],
+        [InlineKeyboardButton("💱 تعديل سعر الصرف", callback_data="edit_rate_btn")],
+        [InlineKeyboardButton("🎯 تعديل سقف التدخين", callback_data="edit_limit_btn")],
+        [InlineKeyboardButton("✏️ تصحيح البيانات (حذف آخر)", callback_data="edit_menu")],
         [InlineKeyboardButton("🧹 تصفير كافة السجلات", callback_data="reset_all_menu")],
         [InlineKeyboardButton("🔙 رجوع", callback_data="refresh")]
     ])
 
+def vendor_menu_kb():
+    with db() as c:
+        rows = c.execute("SELECT id, name FROM vendors").fetchall()
+    kb = []
+    for r in rows:
+        kb.append([InlineKeyboardButton(f"🏪 {r['name']}", callback_data=f"vendor_view|{r['id']}")])
+    kb.append([InlineKeyboardButton("➕ إضافة جهة جديدة", callback_data="add_vendor")])
+    kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="debt_menu")])
+    return InlineKeyboardMarkup(kb)
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(dashboard_text(), parse_mode="Markdown", reply_markup=main_kb())
 
-# ================== CONVERSATIONS ==================
+# ================== EXPENSE ==================
 async def add_exp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q: await q.answer()
@@ -341,7 +312,10 @@ async def add_exp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def exp_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: ctx.user_data["amount"] = float(update.message.text.strip())
     except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("أكل", callback_data="cat|أكل"), InlineKeyboardButton("دخان", callback_data="cat|دخان"), InlineKeyboardButton("سناكات", callback_data="cat|سناكات")],[InlineKeyboardButton("بقالة", callback_data="cat|بقالة"), InlineKeyboardButton("مواصلات", callback_data="cat|مواصلات"), InlineKeyboardButton("أخرى", callback_data="cat|أخرى")]])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("أكل", callback_data="cat|أكل"), InlineKeyboardButton("بقالة", callback_data="cat|بقالة"), InlineKeyboardButton("منظفات", callback_data="cat|منظفات")],
+        [InlineKeyboardButton("مواصلات", callback_data="cat|مواصلات"), InlineKeyboardButton("دخان", callback_data="cat|دخان"), InlineKeyboardButton("أخرى", callback_data="cat|أخرى")]
+    ])
     await update.message.reply_text("📂 اختر نوع المصروف:", reply_markup=kb)
     return EXP_CAT
 
@@ -354,39 +328,37 @@ async def exp_category(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def exp_ptype(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    ctx.user_data["ptype"] = q.data.split("|",1)[1]
-    if ctx.user_data["ptype"] == "cash":
-        await q.edit_message_text("💵 نقداً. لحظة الحفظ...")
-        return await save_expense(update, ctx)
-    await q.edit_message_text("📝 آجل. اكتب *اسم الجهة الدائنة*:", parse_mode="Markdown")
-    return EXP_CREDITOR
-
-async def exp_creditor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["creditor"] = update.message.text.strip()
-    await update.message.reply_text("📅 تاريخ السداد (YYYY-MM-DD) أو `-` لتخطيه:")
-    return EXP_DUE
-
-async def exp_due(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    t = update.message.text.strip()
-    ctx.user_data["due"] = None if t == "-" else t
-    return await save_expense(update, ctx)
-
-async def save_expense(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ud = ctx.user_data
-    cid = None
-    if ud["ptype"] == "credit":
+    ptype = q.data.split("|",1)[1]
+    if ptype == "cash":
         with db() as c:
-            c.execute("INSERT OR IGNORE INTO creditors(name) VALUES(?)", (ud["creditor"],))
-            cid = c.execute("SELECT id FROM creditors WHERE name=?", (ud["creditor"],)).fetchone()["id"]
+            c.execute("INSERT INTO expenses(ts,amount,category,ptype,paid) VALUES(?,?,?,?,1)", (get_ts(), ctx.user_data["amount"], ctx.user_data["category"], "cash"))
+        await q.edit_message_text("✅ تم تسجيل المصروف النقدي.", reply_markup=main_kb())
+        return ConversationHandler.END
+    
+    ctx.user_data["ptype"] = "credit"
     with db() as c:
-        c.execute("INSERT INTO expenses(ts,amount,category,ptype,creditor_id,due_date) VALUES(?,?,?,?,?,?)", (get_ts(), ud["amount"], ud["category"], ud["ptype"], cid, ud.get("due")))
-    await ctx.bot.send_message(update.effective_chat.id, dashboard_text(), parse_mode="Markdown", reply_markup=main_kb())
+        rows = c.execute("SELECT id, name FROM vendors").fetchall()
+    if not rows:
+        await q.edit_message_text("⚠️ لا توجد جهات مسجلة. يرجى إضافتها من إدارة الديون أولاً.", reply_markup=main_kb())
+        return ConversationHandler.END
+        
+    kb = [[InlineKeyboardButton(r["name"], callback_data=f"ven|{r['id']}")] for r in rows]
+    await q.edit_message_text("🏪 اختر الجهة (الدائن):", reply_markup=InlineKeyboardMarkup(kb))
+    return EXP_VENDOR
+
+async def exp_vendor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    vid = q.data.split("|")[1]
+    with db() as c:
+        c.execute("INSERT INTO expenses(ts,amount,category,ptype,vendor_id,paid) VALUES(?,?,?,?,?,0)", (get_ts(), ctx.user_data["amount"], ctx.user_data["category"], "credit", vid))
+    await q.edit_message_text("✅ تم تسجيل المصروف الآجل.", reply_markup=main_kb())
     return ConversationHandler.END
 
+# ================== INCOME ==================
 async def add_inc_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q: await q.answer()
-    msg = "📈 *إضافة إيراد*\nأرسل المبلغ بالريال:"
+    msg = "💵 *إضافة إيراد*\nأرسل المبلغ بالريال:"
     if q: await q.edit_message_text(msg, parse_mode="Markdown")
     else: await update.message.reply_text(msg, parse_mode="Markdown")
     return INC_AMOUNT
@@ -394,195 +366,226 @@ async def add_inc_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def inc_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: ctx.user_data["inc_amount"] = float(update.message.text.strip())
     except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
-    await update.message.reply_text("📝 اكتب مصدر الإيراد:")
+    await update.message.reply_text("📝 اكتب مصدر الإيراد (مثال: راتب):")
     return INC_SOURCE
 
 async def inc_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     with db() as c: c.execute("INSERT INTO incomes(ts, amount, source) VALUES(?,?,?)", (get_ts(), ctx.user_data["inc_amount"], update.message.text.strip()))
-    await update.message.reply_text("✅ تم الحفظ.\n\n" + dashboard_text(), parse_mode="Markdown", reply_markup=main_kb())
+    await update.message.reply_text("✅ تم الإيداع.\n\n" + dashboard_text(), parse_mode="Markdown", reply_markup=main_kb())
     return ConversationHandler.END
 
+# ================== CIGARETTE ==================
+async def cig_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💵 نقدي (من جيبي)", callback_data="cig_type|cash")],
+        [InlineKeyboardButton("📝 آجل (على الحساب)", callback_data="cig_type|credit")],
+        [InlineKeyboardButton("🎁 مجاناً", callback_data="cig_type|free")]
+    ])
+    await q.edit_message_text("🚬 كيف حصلت على هذه السيجارة؟", reply_markup=kb)
+    return CIG_TYPE
+
+async def cig_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    ctype = q.data.split("|")[1]
+    cost = get_cig_price()
+    
+    if ctype == "cash":
+        with db() as c: c.execute("INSERT INTO cigarettes(ts, cig_type, cost) VALUES(?,?,?)", (get_ts(), "cash", cost))
+        await q.edit_message_text("✅ تم الخصم من المحفظة.\n\n" + dashboard_text(), parse_mode="Markdown", reply_markup=main_kb())
+        return ConversationHandler.END
+    elif ctype == "free":
+        with db() as c: c.execute("INSERT INTO cigarettes(ts, cig_type, cost) VALUES(?,?,?)", (get_ts(), "free", 0))
+        await q.edit_message_text("✅ تم التسجيل مجاناً.\n\n" + dashboard_text(), parse_mode="Markdown", reply_markup=main_kb())
+        return ConversationHandler.END
+        
+    # Credit
+    with db() as c:
+        rows = c.execute("SELECT id, name FROM vendors").fetchall()
+    if not rows:
+        await q.edit_message_text("⚠️ لا توجد جهات مسجلة.", reply_markup=main_kb())
+        return ConversationHandler.END
+    kb = [[InlineKeyboardButton(r["name"], callback_data=f"cigven|{r['id']}")] for r in rows]
+    await q.edit_message_text("🏪 اختر الجهة (البقالة):", reply_markup=InlineKeyboardMarkup(kb))
+    return CIG_VENDOR
+
+async def cig_vendor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    vid = q.data.split("|")[1]
+    with db() as c: c.execute("INSERT INTO cigarettes(ts, cig_type, cost, vendor_id) VALUES(?,?,?,?)", (get_ts(), "credit", get_cig_price(), vid))
+    await q.edit_message_text("✅ تم إضافتها لديون الجهة.\n\n" + dashboard_text(), parse_mode="Markdown", reply_markup=main_kb())
+    return ConversationHandler.END
+
+# ================== VENDORS ==================
+async def add_vendor_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("🏪 أرسل اسم الجهة الجديدة (مثال: بقالة الأمانة):")
+    return VENDOR_ADD_NAME
+
+async def vendor_add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    name = update.message.text.strip()
+    with db() as c: c.execute("INSERT OR IGNORE INTO vendors(name) VALUES(?)", (name,))
+    await update.message.reply_text(f"✅ تم إضافة {name}.", reply_markup=debt_menu_kb())
+    return ConversationHandler.END
+
+# ================== LONG DEBT ==================
+async def ld_add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("⏳ *إضافة دين طويل الأجل*\nأرسل اسم الدين (مثال: قرض):")
+    return LD_ADD_NAME
+
+async def ld_add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ctx.user_data["ld_name"] = update.message.text.strip()
+    await update.message.reply_text("أرسل المبلغ الكلي للدين بالريال:")
+    return LD_ADD_AMT
+
+async def ld_add_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try: ctx.user_data["ld_amt"] = float(update.message.text.strip())
+    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
+    await update.message.reply_text("أرسل مبلغ القسط المستحق حالياً (بالريال):")
+    return LD_ADD_INSTALLMENT
+
+async def ld_add_installment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try: inst = float(update.message.text.strip())
+    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
+    with db() as c: c.execute("INSERT INTO long_debts(name, total_sar, installment_sar) VALUES(?,?,?)", (ctx.user_data["ld_name"], ctx.user_data["ld_amt"], inst))
+    await update.message.reply_text("✅ تم الإضافة.", reply_markup=debt_menu_kb())
+    return ConversationHandler.END
+
+# ================== PAY DEBT ==================
+async def pay_debt_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    with db() as c:
+        vendors_debts = c.execute("""
+            SELECT v.id, v.name, COALESCE(SUM(e.amount),0) + COALESCE((SELECT SUM(cost) FROM cigarettes WHERE vendor_id=v.id AND cig_type='credit'),0) as tot
+            FROM vendors v 
+            LEFT JOIN expenses e ON e.vendor_id = v.id AND e.ptype='credit' AND e.paid=0
+            GROUP BY v.id HAVING tot > 0
+        """).fetchall()
+        long_debts = c.execute("SELECT id, name, installment_sar FROM long_debts WHERE total_sar > paid_sar").fetchall()
+        
+    kb = []
+    for r in vendors_debts:
+        kb.append([InlineKeyboardButton(f"🏪 {r['name']} - {r['tot']:.0f} ر.س", callback_data=f"p_debt_v|{r['id']}")])
+    for r in long_debts:
+        kb.append([InlineKeyboardButton(f"⏳ {r['name']} - قسط {r['installment_sar']:.0f} ر.س", callback_data=f"p_debt_l|{r['id']}")])
+        
+    kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="debt_menu")])
+    await q.edit_message_text("💸 اختر الدين الذي تريد سداده:", reply_markup=InlineKeyboardMarkup(kb))
+    return ConversationHandler.END
+
+async def pay_debt_amt_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer()
+    data = q.data.split("|")
+    dtype, did = data[0], data[1]
+    
+    if dtype == "p_debt_v":
+        ctx.user_data["pay_type"] = "vendor"
+        ctx.user_data["pay_id"] = did
+        await q.edit_message_text("💸 كم تريد أن تسدد لهذه الجهة؟ (أرسل المبلغ):")
+    else:
+        ctx.user_data["pay_type"] = "long"
+        ctx.user_data["pay_id"] = did
+        await q.edit_message_text("💸 كم تريد أن تسدد من القسط؟ (أرسل المبلغ):")
+        
+    return PAY_DEBT_AMT
+
+async def pay_debt_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    try: amt = float(update.message.text.strip())
+    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
+    
+    ptype = ctx.user_data["pay_type"]
+    pid = ctx.user_data["pay_id"]
+    
+    with db() as c:
+        if ptype == "vendor":
+            # تحديث المصاريف الآجلة
+            remaining = amt
+            # 1. سداد مصاريف
+            rows = c.execute("SELECT id, amount FROM expenses WHERE vendor_id=? AND ptype='credit' AND paid=0 ORDER BY id ASC", (pid,)).fetchall()
+            for r in rows:
+                if remaining <= 0: break
+                deduct = min(r["amount"], remaining)
+                if deduct == r["amount"]: c.execute("UPDATE expenses SET paid=1 WHERE id=?", (r["id"],))
+                else: c.execute("UPDATE expenses SET amount = amount - ? WHERE id=?", (deduct, r["id"]))
+                remaining -= deduct
+            # 2. سداد سجائر آجلة
+            cigs = c.execute("SELECT id, cost FROM cigarettes WHERE vendor_id=? AND cig_type='credit' ORDER BY id ASC", (pid,)).fetchall()
+            for r in cigs:
+                if remaining <= 0: break
+                deduct = min(r["cost"], remaining)
+                if deduct == r["cost"]: c.execute("DELETE FROM cigarettes WHERE id=?", (r["id"],)) # تحويلها لمصاريف نقدية
+                else: c.execute("UPDATE cigarettes SET cost = cost - ? WHERE id=?", (deduct, r["id"]))
+                remaining -= deduct
+        else:
+            c.execute("UPDATE long_debts SET paid_sar = paid_sar + ? WHERE id=?", (amt, pid))
+            
+        # تسجيل السداد كمصروف نقدي
+        c.execute("INSERT INTO expenses(ts, amount, category, ptype, paid) VALUES(?,?,?,?,1)", (get_ts(), amt, "سداد ديون", "cash"))
+
+    await update.message.reply_text("✅ تم تسجيل السداد وخصمه من المحفظة.", reply_markup=main_kb())
+    return ConversationHandler.END
+
+# ================== SETTINGS ==================
 async def edit_rate_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if q: await q.answer()
-    msg = "💱 أرسل سعر الصرف الجديد (كم جنيه يساوي 1 ريال؟):"
-    if q: await q.edit_message_text(msg)
-    else: await update.message.reply_text(msg)
+    q = update.callback_query; await q.answer()
+    await q.edit_message_text("💱 أرسل سعر الصرف الجديد (كم جنيه يساوي 1 ريال؟):")
     return RATE_INPUT
 
 async def save_rate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: rate = float(update.message.text.strip())
     except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
     with db() as c: c.execute("UPDATE settings SET value=? WHERE key='exchange_rate'", (str(rate),))
-    await update.message.reply_text(f"✅ تم تحديث السعر.\n\n" + dashboard_text(), parse_mode="Markdown", reply_markup=main_kb())
+    await update.message.reply_text("✅ تم تحديث السعر.", reply_markup=main_kb())
     return ConversationHandler.END
 
 async def edit_limit_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    await q.edit_message_text("🎯 أرسل السقف اليومي الجديد للتدخين (مثال: 10):")
+    await q.edit_message_text("🎯 أرسل السقف اليومي الجديد للتدخين:")
     return LIMIT_INPUT
 
 async def save_limit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: limit = int(update.message.text.strip())
     except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً صحيحاً فقط.")
     with db() as c: c.execute("UPDATE settings SET value=? WHERE key='daily_target'", (str(limit),))
-    await update.message.reply_text(f"✅ تم تحديث السقف.\n\n" + dashboard_text(), parse_mode="Markdown", reply_markup=main_kb())
+    await update.message.reply_text("✅ تم تحديث السقف.", reply_markup=main_kb())
     return ConversationHandler.END
 
-# (Sudan, Long Debt, Pay Creditor, Rollover)
-async def sd_add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ================== REPORTS ==================
+async def rep_expenses(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    await q.edit_message_text("🇸🇩 *إضافة مستفيد للسودان*\nأرسل اسم الشخص:")
-    return SD_ADD_NAME
-async def sd_add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
-    with db() as c:
-        if c.execute("SELECT 1 FROM sudan_reqs WHERE name=?", (name,)).fetchone():
-            return await update.message.reply_text("⚠️ الاسم موجود. أرسل اسماً آخر:"); 
-    ctx.user_data["sd_name"] = name
-    await update.message.reply_text("أرسل المبلغ بالجنيه السوداني (ج.س):")
-    return SD_ADD_AMT
-async def sd_add_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try: amt = float(update.message.text.strip())
-    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
-    with db() as c: c.execute("INSERT INTO sudan_reqs(name, amount_sdg) VALUES(?,?)", (ctx.user_data["sd_name"], amt))
-    await update.message.reply_text("✅ تم الإضافة.", reply_markup=main_kb())
-    return ConversationHandler.END
-async def sd_edit_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer(); ctx.user_data["sd_name"] = q.data.split("|")[1]
-    await q.edit_message_text(f"✏️ تعديل مبلغ: *{ctx.user_data['sd_name']}*\nأرسل المبلغ بالجنيه (ج.س):")
-    return SD_EDIT_AMT
-async def sd_edit_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try: amt = float(update.message.text.strip())
-    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
-    with db() as c: c.execute("UPDATE sudan_reqs SET amount_sdg=? WHERE name=?", (amt, ctx.user_data["sd_name"]))
-    await update.message.reply_text("✅ تم التعديل.", reply_markup=main_kb())
-    return ConversationHandler.END
-async def sd_pay_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer(); ctx.user_data["sd_name"] = q.data.split("|")[1]
-    await q.edit_message_text(f"💸 تحويل إلى: *{ctx.user_data['sd_name']}*\nأرسل المبلغ (بالجنيه):")
-    return SD_PAY_AMT
-async def sd_pay_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try: amt = float(update.message.text.strip())
-    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
-    rate = get_rate(); paid_sdg = amt; paid_sar = amt / rate
-    with db() as c:
-        c.execute("INSERT INTO sudan_pays(ts, name, paid_sdg, paid_sar) VALUES(?,?,?,?)", (get_ts(), ctx.user_data["sd_name"], paid_sdg, paid_sar))
-        c.execute("INSERT INTO expenses(ts,amount,category,ptype,creditor_id,due_date) VALUES(?,?,?,?,?,?)", (get_ts(), paid_sar, "تحويل السودان", "cash", None, None))
-    await update.message.reply_text(f"✅ تم تحويل {paid_sdg:,.0f} ج.س ({paid_sar:,.2f} ر.س).", reply_markup=main_kb())
-    return ConversationHandler.END
-async def sd_del_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer(); name = q.data.split("|")[1]
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚠️ نعم، احذف", callback_data=f"sd_del_confirm|{name}")], [InlineKeyboardButton("🔙 إلغاء", callback_data="menu_sudan")]])
-    await q.edit_message_text(f"هل أنت متأكد من حذف *{name}*؟", reply_markup=kb)
-async def sd_del_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer(); name = q.data.split("|")[1]
-    with db() as c: c.execute("DELETE FROM sudan_reqs WHERE name=?", (name,)); c.execute("DELETE FROM sudan_pays WHERE name=?", (name,))
-    await q.edit_message_text(f"✅ تم حذف {name}.", reply_markup=sudan_menu_kb())
+    text, total = get_expense_breakdown("month")
+    rate = get_rate()
+    msg = f"🧾 *بيان مصروفات الشهر:*\n💵 الإجمالي: {total:,.0f} ر.س ({total*rate:,.0f} ج.س)\n\n{text}"
+    await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=report_menu_kb())
 
-async def ld_add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+async def rep_debts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
-    await q.edit_message_text("⏳ *إضافة دين طويل الأجل*\nأرسل اسم الدين:")
-    return LD_ADD_NAME
-async def ld_add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    ctx.user_data["ld_name"] = update.message.text.strip()
-    await update.message.reply_text("أرسل المبلغ بالريال (ر.س):")
-    return LD_ADD_AMT
-async def ld_add_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try: amt = float(update.message.text.strip())
-    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
-    with db() as c: c.execute("INSERT INTO long_debts(name, total_sar) VALUES(?,?)", (ctx.user_data["ld_name"], amt))
-    await update.message.reply_text("✅ تم الإضافة.", reply_markup=main_kb())
-    return ConversationHandler.END
-async def ld_edit_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer(); ctx.user_data["ld_id"] = q.data.split("|")[1]
-    await q.edit_message_text("✏️ أرسل المبلغ الكلي الجديد بالريال (ر.س):")
-    return LD_EDIT_AMT
-async def ld_edit_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try: amt = float(update.message.text.strip())
-    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
-    with db() as c: c.execute("UPDATE long_debts SET total_sar=? WHERE id=?", (amt, ctx.user_data["ld_id"]))
-    await update.message.reply_text("✅ تم التعديل.", reply_markup=main_kb())
-    return ConversationHandler.END
-async def ld_pay_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer(); ctx.user_data["ld_id"] = q.data.split("|")[1]
-    await q.edit_message_text("💸 أرسل مبلغ السداد بالريال (ر.س):")
-    return LD_PAY_AMT
-async def ld_pay_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try: amt = float(update.message.text.strip())
-    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
-    with db() as c:
-        c.execute("UPDATE long_debts SET paid_sar = paid_sar + ? WHERE id=?", (amt, ctx.user_data["ld_id"]))
-        c.execute("INSERT INTO expenses(ts,amount,category,ptype,creditor_id,due_date) VALUES(?,?,?,?,?,?)", (get_ts(), amt, "سداد دين طويل", "cash", None, None))
-    await update.message.reply_text("✅ تم السداد.", reply_markup=main_kb())
-    return ConversationHandler.END
-async def ld_del_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer(); id_ = q.data.split("|")[1]
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚠️ نعم، احذف", callback_data=f"ld_del_confirm|{id_}")], [InlineKeyboardButton("🔙 إلغاء", callback_data="menu_long")]])
-    await q.edit_message_text("تأكيد حذف الدين؟", reply_markup=kb)
-async def ld_del_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer(); id_ = q.data.split("|")[1]
-    with db() as c: c.execute("DELETE FROM long_debts WHERE id=?", (id_,))
-    await q.edit_message_text("✅ تم الحذف.", reply_markup=long_menu_kb())
+    total_debt, short_debt, long_installments = get_debt_summary()
+    rate = get_rate()
+    msg = (
+        f"📉 *تقرير الديون:*\n"
+        f"🔴 *إجمالي الالتزامات:* {total_debt:,.0f} ر.س ({total_debt*rate:,.0f} ج.س)\n\n"
+        f"• قصيرة الأجل: {short_debt:,.0f} ر.س\n"
+        f"• أقساط طويلة الأجل: {long_installments:,.0f} ر.س"
+    )
+    await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=report_menu_kb())
 
-async def pay_cred_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    cid = q.data.split("|")[1]; ctx.user_data["cred_id"] = cid
-    await q.edit_message_text("💸 كم تريد أن تسدد من هذا الدين؟ (أرسل المبلغ):")
-    return PAY_CREDITOR_AMT
-
-async def pay_cred_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try: amt = float(update.message.text.strip())
-    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
-    ctx.user_data["pay_amt"] = amt
-    await update.message.reply_text(f"هل تريد تسجيل هذا السداد كـ *نقدي* (سيخصم من الرصيد) أم *آجل* (تحويل الدين)؟", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ نقدي", callback_data="pay_cred_type|cash"),
-        InlineKeyboardButton("📝 آجل", callback_data="pay_cred_type|credit")
-    ]]))
-    return PAY_CREDITOR_TYPE
-
-async def pay_cred_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    ptype = q.data.split("|")[1]
-    amt = ctx.user_data["pay_amt"]; cid = ctx.user_data["cred_id"]
-    
-    with db() as c:
-        if ptype == "cash":
-            remaining = amt
-            rows = c.execute("SELECT id, amount FROM expenses WHERE creditor_id=? AND ptype='credit' AND paid=0 ORDER BY id ASC", (cid,)).fetchall()
-            for r in rows:
-                if remaining <= 0: break
-                deduct = min(r["amount"], remaining)
-                if deduct == r["amount"]:
-                    c.execute("UPDATE expenses SET paid=1 WHERE id=?", (r["id"],))
-                else:
-                    c.execute("UPDATE expenses SET amount = amount - ? WHERE id=?", (deduct, r["id"]))
-                remaining -= deduct
-            c.execute("INSERT INTO expenses(ts,amount,category,ptype,creditor_id,due_date) VALUES(?,?,?,?,?,?)", (get_ts(), amt, "سداد دين آجل", "cash", None, None))
-            await q.edit_message_text(f"✅ تم تسجيل سداد نقدي بقيمة {amt:.0f} ر.س وخصمه من المحفظة.", reply_markup=main_kb())
-        else:
-            await q.edit_message_text("⚠️ التحويل الآجل قيد التطوير (يُفضل السداد النقدي حالياً).", reply_markup=main_kb())
-    return ConversationHandler.END
-
+# ================== ROLLOVER ==================
 async def rollover_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     wallet = get_wallet_balance()
-    await q.edit_message_text(f"🔄 *الترحيل للشهر القادم*\n\nرصيدك الحالي هو {wallet:,.2f} ر.س.\nكم تريد أن ترحل كرصيد افتتاحي للشهر القادم؟ (أرسل المبلغ):", parse_mode="Markdown")
+    await q.edit_message_text(f"🔄 *الترحيل للشهر القادم*\nرصيدك الحالي هو {wallet:,.2f} ر.س.\nكم تريد أن ترحل كرصيد افتتاحي؟ (أرسل المبلغ):", parse_mode="Markdown")
     return ROLLOVER_CASH
 
 async def rollover_cash(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: amt = float(update.message.text.strip())
     except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
-    with db() as c:
-        c.execute("INSERT INTO incomes(ts, amount, source) VALUES(?,?,?)", (get_ts(), amt, "رصيد افتتاحي مرحل"))
-    await update.message.reply_text(f"✅ تم ترحيل {amt:,.2f} ر.س كرصيد افتتاحي. ستبدأ الشهر الجديد بهذا الرصيد.", reply_markup=main_kb())
+    with db() as c: c.execute("INSERT INTO incomes(ts, amount, source) VALUES(?,?,?)", (get_ts(), amt, "رصيد افتتاحي مرحل"))
+    await update.message.reply_text(f"✅ تم ترحيل {amt:,.2f} ر.س كإيراد جديد للشهر الجديد.", reply_markup=main_kb())
     return ConversationHandler.END
 
-async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("❌ تم الإلغاء.", reply_markup=main_kb())
-    return ConversationHandler.END
-
-# ================== BUTTON HANDLER ==================
+# ================== MAIN HANDLER ==================
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q: await q.answer()
@@ -590,13 +593,17 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     if data == "noop": return
 
-    if data == "cig":
-        target = get_daily_target()
-        if len(cigs_today()) >= target:
-            await q.answer("⚠️ وصلت السقف اليومي!", show_alert=True); return
-        with db() as c: c.execute("INSERT INTO cigarettes(ts) VALUES(?)", (get_ts(),))
+    if data == "refresh":
         await q.edit_message_text(dashboard_text(), parse_mode="Markdown", reply_markup=main_kb())
-        
+    elif data == "debt_menu":
+        await q.edit_message_text("💼 *إدارة الديون*", parse_mode="Markdown", reply_markup=debt_menu_kb())
+    elif data == "report_menu":
+        await q.edit_message_text("📊 *التقارير*", parse_mode="Markdown", reply_markup=report_menu_kb())
+    elif data == "settings_menu":
+        await q.edit_message_text("⚙️ *الإعدادات*", parse_mode="Markdown", reply_markup=settings_menu_kb())
+    elif data == "vendor_menu":
+        await q.edit_message_text("🏪 *إدارة الجهات*", parse_mode="Markdown", reply_markup=vendor_menu_kb())
+    
     elif data.startswith("pr|"):
         p_name = data.split("|")[1]
         today = now().date().isoformat()
@@ -605,43 +612,39 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             new_status = 1 if not row or row["status"] == 0 else 0
             c.execute("INSERT OR REPLACE INTO prayers(date, name, status) VALUES(?,?,?)", (today, p_name, new_status))
         await q.edit_message_text(dashboard_text(), parse_mode="Markdown", reply_markup=main_kb())
-        
-    elif data == "refresh":
-        await q.edit_message_text(dashboard_text(), parse_mode="Markdown", reply_markup=main_kb())
-        
-    elif data == "accrued_menu":
-        await q.edit_message_text("💼 *إدارة الديون والمصاريف*", parse_mode="Markdown", reply_markup=accrued_menu_kb())
-    elif data == "monthly_report":
-        await q.edit_message_text("📊 *التقارير والترحيل*\nهنا يمكنك ترحيل رصيدك للشهر القادم:", parse_mode="Markdown", reply_markup=monthly_report_kb())
-    elif data == "do_rollover": await rollover_start(update, ctx)
-    elif data == "menu_credit":
-        await q.edit_message_text("📉 *الديون الآجلة (بقالة وأشخاص):*\nاختر جهة للسداد:", parse_mode="Markdown", reply_markup=credit_menu_kb())
-    elif data == "menu_sudan":
-        await q.edit_message_text("🇸🇩 *مستحقات السودان:*", parse_mode="Markdown", reply_markup=sudan_menu_kb())
-    elif data == "menu_long":
-        await q.edit_message_text("⏳ *الديون طويلة الأجل:*", parse_mode="Markdown", reply_markup=long_menu_kb())
-        
-    elif data.startswith("sd_del_confirm|"): await sd_del_confirm(update, ctx)
-    elif data.startswith("ld_del_confirm|"): await ld_del_confirm(update, ctx)
+
     elif data == "edit_menu":
-        await q.edit_message_text("✏️ *إدارة وتصحيح البيانات*", parse_mode="Markdown", reply_markup=edit_kb())
-    elif data == "del_cig":
-        with db() as c:
-            row = c.execute("SELECT id FROM cigarettes ORDER BY id DESC LIMIT 1").fetchone()
-            if row: c.execute("DELETE FROM cigarettes WHERE id=?", (row["id"],))
-        await q.edit_message_text(dashboard_text(), parse_mode="Markdown", reply_markup=main_kb())
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑️ حذف آخر مصروف", callback_data="del_exp"), InlineKeyboardButton("🗑️ حذف آخر سيجارة", callback_data="del_cig")],
+            [InlineKeyboardButton("🔙 رجوع", callback_data="settings_menu")]
+        ])
+        await q.edit_message_text("✏️ *التصحيح*", reply_markup=kb)
     elif data == "del_exp":
         with db() as c:
             row = c.execute("SELECT id FROM expenses ORDER BY id DESC LIMIT 1").fetchone()
             if row: c.execute("DELETE FROM expenses WHERE id=?", (row["id"],))
-        await q.edit_message_text(dashboard_text(), parse_mode="Markdown", reply_markup=main_kb())
+        await q.edit_message_text("✅ تم حذف آخر مصروف.", reply_markup=settings_menu_kb())
+    elif data == "del_cig":
+        with db() as c:
+            row = c.execute("SELECT id FROM cigarettes ORDER BY id DESC LIMIT 1").fetchone()
+            if row: c.execute("DELETE FROM cigarettes WHERE id=?", (row["id"],))
+        await q.edit_message_text("✅ تم حذف آخر سيجارة.", reply_markup=settings_menu_kb())
+        
     elif data == "reset_all_menu":
         kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚠️ نعم، امسح كل شيء", callback_data="do_reset_all")], [InlineKeyboardButton("🔙 إلغاء", callback_data="refresh")]])
-        await q.edit_message_text("⚠️ مسح كل السجلات نهائياً للبدء من جديد؟", reply_markup=kb)
+        await q.edit_message_text("⚠️ مسح كل السجلات نهائياً؟", reply_markup=kb)
     elif data == "do_reset_all":
         with db() as c:
-            c.execute("DELETE FROM cigarettes"); c.execute("DELETE FROM expenses"); c.execute("DELETE FROM prayers"); c.execute("DELETE FROM incomes"); c.execute("DELETE FROM sudan_pays"); c.execute("DELETE FROM long_debts"); c.execute("DELETE FROM sudan_reqs"); c.execute("DELETE FROM creditors")
-        await q.edit_message_text("🧹 *تم مسح جميع السجلات!* يمكنك البدء الآن من جديد.", parse_mode="Markdown", reply_markup=main_kb())
+            c.execute("DELETE FROM cigarettes"); c.execute("DELETE FROM expenses"); c.execute("DELETE FROM prayers"); c.execute("DELETE FROM incomes"); c.execute("DELETE FROM long_debts"); c.execute("DELETE FROM vendors")
+        await q.edit_message_text("🧹 *تم مسح كل شيء!*", reply_markup=main_kb())
+
+    elif data == "rep_expenses_month": await rep_expenses(update, ctx)
+    elif data == "rep_debts": await rep_debts(update, ctx)
+    elif data.startswith("p_debt_"): await pay_debt_amt_start(update, ctx)
+
+async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ تم الإلغاء.", reply_markup=main_kb())
+    return ConversationHandler.END
 
 if __name__ == "__main__":
     init()
@@ -652,22 +655,17 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("cancel", cancel))
     
     convs = [
-        ConversationHandler(entry_points=[CallbackQueryHandler(add_exp_start, pattern="^add_exp_btn$"), CommandHandler("expense", add_exp_start)], states={EXP_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_amount)], EXP_CAT: [CallbackQueryHandler(exp_category, pattern="^cat\\|")], EXP_PTYPE: [CallbackQueryHandler(exp_ptype, pattern="^pt\\|")], EXP_CREDITOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_creditor)], EXP_DUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_due)]}, fallbacks=[CommandHandler("cancel", cancel)]),
+        ConversationHandler(entry_points=[CallbackQueryHandler(add_exp_start, pattern="^add_exp_btn$"), CommandHandler("expense", add_exp_start)], states={EXP_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_amount)], EXP_CAT: [CallbackQueryHandler(exp_category, pattern="^cat\\|")], EXP_PTYPE: [CallbackQueryHandler(exp_ptype, pattern="^pt\\|")], EXP_VENDOR: [CallbackQueryHandler(exp_vendor, pattern="^ven\\|")]}, fallbacks=[CommandHandler("cancel", cancel)]),
         ConversationHandler(entry_points=[CallbackQueryHandler(add_inc_start, pattern="^add_inc_btn$")], states={INC_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, inc_amount)], INC_SOURCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, inc_source)]}, fallbacks=[CommandHandler("cancel", cancel)]),
+        ConversationHandler(entry_points=[CallbackQueryHandler(cig_start, pattern="^cig$")], states={CIG_TYPE: [CallbackQueryHandler(cig_type, pattern="^cig_type\\|")], CIG_VENDOR: [CallbackQueryHandler(cig_vendor, pattern="^cigven\\|")]}, fallbacks=[CommandHandler("cancel", cancel)]),
+        ConversationHandler(entry_points=[CallbackQueryHandler(add_vendor_start, pattern="^add_vendor$")], states={VENDOR_ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, vendor_add_name)]}, fallbacks=[CommandHandler("cancel", cancel)]),
+        ConversationHandler(entry_points=[CallbackQueryHandler(ld_add_start, pattern="^add_long_debt$")], states={LD_ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ld_add_name)], LD_ADD_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ld_add_amt)], LD_ADD_INSTALLMENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ld_add_installment)]}, fallbacks=[CommandHandler("cancel", cancel)]),
+        ConversationHandler(entry_points=[CallbackQueryHandler(pay_debt_start, pattern="^pay_debt_menu$"), CallbackQueryHandler(pay_debt_amt_start, pattern="^p_debt_")], states={PAY_DEBT_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, pay_debt_amt)]}, fallbacks=[CommandHandler("cancel", cancel)]),
         ConversationHandler(entry_points=[CallbackQueryHandler(edit_rate_start, pattern="^edit_rate_btn$")], states={RATE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_rate)]}, fallbacks=[CommandHandler("cancel", cancel)]),
         ConversationHandler(entry_points=[CallbackQueryHandler(edit_limit_start, pattern="^edit_limit_btn$")], states={LIMIT_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_limit)]}, fallbacks=[CommandHandler("cancel", cancel)]),
-        ConversationHandler(entry_points=[CallbackQueryHandler(sd_add_start, pattern="^sd_add$")], states={SD_ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, sd_add_name)], SD_ADD_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sd_add_amt)]}, fallbacks=[CommandHandler("cancel", cancel)]),
-        ConversationHandler(entry_points=[CallbackQueryHandler(sd_edit_start, pattern="^sd_edit\\|")], states={SD_EDIT_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sd_edit_amt)]}, fallbacks=[CommandHandler("cancel", cancel)]),
-        ConversationHandler(entry_points=[CallbackQueryHandler(sd_pay_start, pattern="^sd_pay\\|")], states={SD_PAY_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sd_pay_amt)]}, fallbacks=[CommandHandler("cancel", cancel)]),
-        CallbackQueryHandler(sd_del_start, pattern="^sd_del\\|"),
-        ConversationHandler(entry_points=[CallbackQueryHandler(ld_add_start, pattern="^ld_add$")], states={LD_ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ld_add_name)], LD_ADD_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ld_add_amt)]}, fallbacks=[CommandHandler("cancel", cancel)]),
-        ConversationHandler(entry_points=[CallbackQueryHandler(ld_edit_start, pattern="^ld_edit\\|")], states={LD_EDIT_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ld_edit_amt)]}, fallbacks=[CommandHandler("cancel", cancel)]),
-        ConversationHandler(entry_points=[CallbackQueryHandler(ld_pay_start, pattern="^ld_pay\\|")], states={LD_PAY_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ld_pay_amt)]}, fallbacks=[CommandHandler("cancel", cancel)]),
-        CallbackQueryHandler(ld_del_start, pattern="^ld_del\\|"),
-        ConversationHandler(entry_points=[CallbackQueryHandler(pay_cred_start, pattern="^pay_cred\\|")], states={PAY_CREDITOR_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, pay_cred_amt)], PAY_CREDITOR_TYPE: [CallbackQueryHandler(pay_cred_type, pattern="^pay_cred_type\\|")]}, fallbacks=[CommandHandler("cancel", cancel)]),
         ConversationHandler(entry_points=[CallbackQueryHandler(rollover_start, pattern="^do_rollover$")], states={ROLLOVER_CASH: [MessageHandler(filters.TEXT & ~filters.COMMAND, rollover_cash)]}, fallbacks=[CommandHandler("cancel", cancel)]),
     ]
     for conv in convs: app.add_handler(conv)
     app.add_handler(CallbackQueryHandler(on_button))
-    print("✅ البوت يعمل...")
+    print("✅ النظام المتكامل يعمل...")
     app.run_polling()
