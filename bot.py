@@ -29,17 +29,14 @@ TOKEN = os.environ.get("BOT_TOKEN")
 DB = "monitor.db"
 TZ = ZoneInfo("Asia/Riyadh")
 
-# Conversation States
+# States
 (EXP_AMOUNT, EXP_CAT, EXP_PTYPE, EXP_CREDITOR, EXP_DUE, 
  INC_AMOUNT, INC_SOURCE, 
  RATE_INPUT, LIMIT_INPUT,
  SD_ADD_NAME, SD_ADD_AMT, SD_EDIT_AMT, SD_PAY_AMT,
  LD_ADD_NAME, LD_ADD_AMT, LD_EDIT_AMT, LD_PAY_AMT,
  PAY_CREDITOR_AMT, PAY_CREDITOR_TYPE,
- ROLLOVER_CASH, ROLLOVER_DEBTS) = range(21)
-
-SCHEDULE_NORMAL = ["09:00", "10:10", "11:20", "12:30", "13:30", "17:00", "18:15", "19:30", "20:45", "22:00", "23:15", "00:30"]
-SCHEDULE_FRIDAY = ["11:00", "12:00", "13:15", "14:30", "15:45", "17:00", "18:15", "19:30", "20:45", "22:00", "23:15", "00:30"]
+ ROLLOVER_CASH) = range(20)
 
 def now():
     return datetime.now(TZ)
@@ -83,11 +80,55 @@ def get_rate(): return get_setting('exchange_rate', 140.0)
 def get_daily_target(): return int(get_setting('daily_target', 15.0))
 
 def get_next_cig_time():
-    sched = SCHEDULE_FRIDAY if now().weekday() == 4 else SCHEDULE_NORMAL
-    current_time = now().strftime("%H:%M")
-    for t in sched:
-        if t > current_time: return t
-    return "غداً صباحاً"
+    # خوارزمية التدخين الذكية
+    t = now()
+    target = get_daily_target()
+    today_str = t.strftime("%Y-%m-%d")
+    
+    with db() as c:
+        smoked = c.execute("SELECT COUNT(*) c FROM cigarettes WHERE ts LIKE ?", (f"{today_str}%",)).fetchone()["c"]
+    
+    remaining = max(0, target - smoked)
+    if remaining <= 1:
+        return "توقفت لهذا اليوم"
+
+    # تحديد أوقات اليقظة (بالتوقيت المحلي)
+    is_weekend = t.weekday() in (4, 5) # الجمعة والسبت
+    wake_time_1 = t.replace(hour=9, minute=0, second=0, microsecond=0) # نبدأ 9 لتجنب الريق
+    sleep_time_1 = t.replace(hour=14, minute=0, second=0, microsecond=0)
+    wake_time_2 = t.replace(hour=17, minute=0, second=0, microsecond=0)
+    sleep_time_2 = t.replace(hour=2, minute=0, second=0, microsecond=0) + timedelta(days=1)
+
+    current = t
+    
+    # إذا كان الوقت قبل 9 صباحاً
+    if current < wake_time_1:
+        return "09:00 ص"
+    
+    # حساب الوقت المتبقي في فترة اليقظة الأولى
+    if wake_time_1 <= current < sleep_time_1:
+        rem_mins_1 = (sleep_time_1 - current).total_seconds() / 60
+        rem_mins_2 = (sleep_time_2 - wake_time_2).total_seconds() / 60
+        total_awake_mins = rem_mins_1 + rem_mins_2
+    elif wake_time_2 <= current < sleep_time_2:
+        total_awake_mins = (sleep_time_2 - current).total_seconds() / 60
+    else:
+        # في وقت النوم (القيلولة)
+        return "05:00 م"
+
+    # المعادلة: (إجمالي الوقت المتبقي من اليقظة) / (عدد السجائر المتبقية)
+    gap = total_awake_mins / remaining
+    next_time = current + timedelta(minutes=gap)
+    
+    # إذا تخطى وقت النوم الأول
+    if next_time > sleep_time_1 and current < sleep_time_1:
+        next_time = wake_time_2
+        
+    # إذا تخطى وقت النوم الثاني
+    if next_time > sleep_time_2:
+         return "غداً 09:00 ص"
+
+    return next_time.strftime("%I:%M %p").replace("AM", "ص").replace("PM", "م")
 
 def cigs_today():
     today_str = now().strftime("%Y-%m-%d")
@@ -128,7 +169,7 @@ def get_next_prayer_al_qurayyat():
                 minutes, _ = divmod(remainder, 60)
                 rem_str = f"{hours} س و " if hours > 0 else ""
                 rem_str += f"{minutes} د"
-                p_12 = datetime.strptime(p_time, fmt).strftime("%I:%M %p")
+                p_12 = datetime.strptime(p_time, fmt).strftime("%I:%M %p").replace("AM", "ص").replace("PM", "م")
                 return f"⏳ القادمة: {p_name} - {p_12} (بعد {rem_str})"
         return "⏳ القادمة: الفجر (غداً)"
     except: return "⏳ تعذر جلب المواقيت"
@@ -137,16 +178,13 @@ def get_expense_breakdown():
     today_str = now().strftime("%Y-%m-%d")
     with db() as c:
         rows = c.execute("SELECT category, SUM(amount) as total FROM expenses WHERE ts LIKE ? GROUP BY category", (f"{today_str}%",)).fetchall()
-    if not rows: return "لا توجد مصاريف اليوم.", 0
+    if not rows: return "*(لا توجد مصاريف اليوم)*", 0
     
     rate = get_rate()
     total_sar = sum(r["total"] for r in rows)
-    lines = ["```text", "الفئة      | بالريال | بالجنيه", "-----------|---------|---------"]
+    lines = []
     for r in sorted(rows, key=lambda x: x["total"], reverse=True):
-        lines.append(f"{r['category']:<10} | {r['total']:>7.0f} | {r['total']*rate:>9.0f}")
-    lines.append("-----------|---------|---------")
-    lines.append(f"{'الإجمالي':<10} | {total_sar:>7.0f} | {total_sar*rate:>9.0f}")
-    lines.append("```")
+        lines.append(f"• {r['category']}: {r['total']:.0f} ر.س ({r['total']*rate:,.0f} ج.س) | {(r['total']/total_sar)*100:.0f}%")
     return "\n".join(lines), total_sar
 
 def get_cumulative_stats():
@@ -161,13 +199,10 @@ def get_cumulative_stats():
         other_tot = c.execute("SELECT SUM(amount) s FROM expenses WHERE ptype='cash' AND category NOT IN ('بقالة', 'تحويل السودان', 'سداد دين طويل')").fetchone()["s"] or 0
 
     grand_total = smoke_tot + grocery_tot + sudan_tot + deferred_tot + other_tot
-    if grand_total == 0: return "لا توجد مصاريف تراكمية.", 0
+    if grand_total == 0: return "*(لا توجد مصاريف تراكمية)*", 0
 
-    lines = ["```text", "الفئة      | بالريال | بالجنيه  | النسبة", "-----------|---------|----------|-------"]
-    def add_row(name, amt):
-        lines.append(f"{name:<10} | {amt:>7.0f} | {amt*rate:>8.0f} | {int((amt/grand_total)*100):>3}%")
-    add_row("دخان", smoke_tot); add_row("بقالة", grocery_tot); add_row("أخرى", other_tot); add_row("ديون آجلة", deferred_tot); add_row("السودان", sudan_tot)
-    lines.append("```")
+    def add_row(name, amt): return f"• {name}: {amt:,.0f} ر.س ({amt*rate:,.0f} ج.س) | {(amt/grand_total)*100:.0f}%"
+    lines = [add_row("دخان", smoke_tot), add_row("بقالة", grocery_tot), add_row("أخرى", other_tot), add_row("ديون آجلة", deferred_tot), add_row("السودان", sudan_tot)]
     return "\n".join(lines), grand_total
 
 def dashboard_text():
@@ -195,42 +230,31 @@ def dashboard_text():
     due_date = get_end_of_month()
 
     return (
-        f"📅 *{now().strftime('%A %d %B %Y | %I:%M %p')}*\n"
+        f"📅 *{now().strftime('%A %d %B %Y | %I:%M %p').replace('AM', 'ص').replace('PM', 'م')}*\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"🚬 *رحلة الإقلاع عن التدخين:*\n"
-        f"```text\n"
-        f"السقف المستهدف | {target} سيجارة\n"
-        f"المدخن اليوم    | {smoked}\n"
-        f"المتبقي         | {remaining}\n"
-        f"القادمة         | {next_cig}\n"
-        f"نسبة الالتزام   | {compliance_pct:.0f}%\n"
-        f"```\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"🎯 السقف المستهدف: *{target} سيجارة*\n"
+        f"📊 المدخن اليوم: *{smoked}* | المتبقي: *{remaining}*\n"
+        f"⏰ السيجارة القادمة: *{next_cig}*\n"
+        f"🛡️ نسبة الالتزام: *{compliance_pct:.0f}%*\n\n"
         f"📈 *المحفظة المالية:*\n"
-        f"```text\n"
-        f"الرصيد المتاح  | {wallet:,.2f} ر.س\n"
-        f"سعر الصرف      | 1 ر.س = {rate} ج.س\n"
-        f"```\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💵 الرصيد المتاح: *{wallet:,.2f} ر.س*\n"
+        f"💱 سعر الصرف: *1 ر.س = {rate} ج.س*\n\n"
         f"💰 *مصاريف اليوم:*\n"
-        f"💵 *الإجمالي: {today_total:.0f} ر.س ({today_total*rate:,.0f} ج.س)*\n"
-        f"{breakdown_text}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🕌 *الصلوات:*\n{p_icons}\n"
-        f"{next_prayer_text}\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"💼 *المصاريف المستحقة (استحقاق: {due_date}):*\n"
-        f"```text\n"
-        f"السودان        | {sudan_rem_sar:,.0f} ر.س ({(sudan_req-sudan_paid):,.0f} ج.س)\n"
-        f"ديون طويلة     | {long_rem_sar:,.0f} ر.س ({long_rem_sar*rate:,.0f} ج.س)\n"
-        f"ديون آجلة      | {credit_tot:,.0f} ر.س ({credit_tot*rate:,.0f} ج.س)\n"
-        f"```\n"
-        f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📈 *التراكمي الكلي للمصاريف:*\n"
-        f"💵 *الإجمالي: {cum_total:,.0f} ر.س*\n"
+        f"💵 الإجمالي: *{today_total:.0f} ر.س ({today_total*rate:,.0f} ج.س)*\n"
+        f"{breakdown_text}\n\n"
+        f"🕌 *الصلوات:*\n"
+        f"{p_icons}\n"
+        f"{next_prayer_text}\n\n"
+        f"💼 *الالتزامات (استحقاق: {due_date}):*\n"
+        f"🇸🇩 السودان: *{sudan_rem_sar:,.0f} ر.س* ({(sudan_req-sudan_paid):,.0f} ج.س)\n"
+        f"⏳ طويلة الأجل: *{long_rem_sar:,.0f} ر.س* ({long_rem_sar*rate:,.0f} ج.س)\n"
+        f"📉 ديون آجلة: *{credit_tot:,.0f} ر.س* ({credit_tot*rate:,.0f} ج.س)\n\n"
+        f"📊 *التراكمي الكلي:*\n"
+        f"💵 الإجمالي: *{cum_total:,.0f} ر.س*\n"
         f"{cum_text}\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🚀 *نظامي الخاص — رحلة النجاح مستمرة | صالح محمد علي*"
+        f"🚀 رحلة النجاح مستمرة | *صالح محمد علي*"
     )
 
 def main_kb():
@@ -405,7 +429,7 @@ async def save_limit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ تم تحديث السقف.\n\n" + dashboard_text(), parse_mode="Markdown", reply_markup=main_kb())
     return ConversationHandler.END
 
-# (Sudan, Long Debt, Pay Creditor)
+# (Sudan, Long Debt, Pay Creditor, Rollover)
 async def sd_add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     await q.edit_message_text("🇸🇩 *إضافة مستفيد للسودان*\nأرسل اسم الشخص:")
@@ -501,7 +525,6 @@ async def ld_del_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     with db() as c: c.execute("DELETE FROM long_debts WHERE id=?", (id_,))
     await q.edit_message_text("✅ تم الحذف.", reply_markup=long_menu_kb())
 
-# Double Entry: Pay Creditor
 async def pay_cred_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     cid = q.data.split("|")[1]; ctx.user_data["cred_id"] = cid
@@ -525,7 +548,6 @@ async def pay_cred_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     
     with db() as c:
         if ptype == "cash":
-            # Deduct from specific expenses (simplified: mark as paid and record cash expense)
             remaining = amt
             rows = c.execute("SELECT id, amount FROM expenses WHERE creditor_id=? AND ptype='credit' AND paid=0 ORDER BY id ASC", (cid,)).fetchall()
             for r in rows:
@@ -536,14 +558,12 @@ async def pay_cred_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 else:
                     c.execute("UPDATE expenses SET amount = amount - ? WHERE id=?", (deduct, r["id"]))
                 remaining -= deduct
-                
             c.execute("INSERT INTO expenses(ts,amount,category,ptype,creditor_id,due_date) VALUES(?,?,?,?,?,?)", (get_ts(), amt, "سداد دين آجل", "cash", None, None))
             await q.edit_message_text(f"✅ تم تسجيل سداد نقدي بقيمة {amt:.0f} ر.س وخصمه من المحفظة.", reply_markup=main_kb())
         else:
             await q.edit_message_text("⚠️ التحويل الآجل قيد التطوير (يُفضل السداد النقدي حالياً).", reply_markup=main_kb())
     return ConversationHandler.END
 
-# Monthly Rollover
 async def rollover_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     wallet = get_wallet_balance()
@@ -553,13 +573,9 @@ async def rollover_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def rollover_cash(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     try: amt = float(update.message.text.strip())
     except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
-    
     with db() as c:
         c.execute("INSERT INTO incomes(ts, amount, source) VALUES(?,?,?)", (get_ts(), amt, "رصيد افتتاحي مرحل"))
-    
-    # Simplistic rollover: we just add the carried amount as a new income.
-    # In a real ERP, we would close the period. For this bot, adding it as income creates the opening balance.
-    await update.message.reply_text(f"✅ تم ترحيل {amt:,.2f} ر.س كرصيد افتتاحي. ستبدأ الشهر الجديد بهذا الرصيد (يمكنك تصفير المصاريف القديمة من قائمة الإدارة).", reply_markup=main_kb())
+    await update.message.reply_text(f"✅ تم ترحيل {amt:,.2f} ر.س كرصيد افتتاحي. ستبدأ الشهر الجديد بهذا الرصيد.", reply_markup=main_kb())
     return ConversationHandler.END
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
