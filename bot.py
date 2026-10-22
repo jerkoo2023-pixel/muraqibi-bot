@@ -3,6 +3,7 @@ nest_asyncio.apply()
 
 import os
 import sqlite3
+import calendar
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from flask import Flask
@@ -46,6 +47,12 @@ SCHEDULE_FRIDAY = ["11:00", "12:00", "13:15", "14:30", "15:45", "17:00", "18:15"
 
 def now():
     return datetime.now(TZ)
+
+def get_end_of_month():
+    today = now().date()
+    last_day = calendar.monthrange(today.year, today.month)[1]
+    month_names = ["يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو", "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"]
+    return f"{last_day} {month_names[today.month-1]}"
 
 def get_next_cig_time():
     sched = SCHEDULE_FRIDAY if now().weekday() == 4 else SCHEDULE_NORMAL
@@ -104,50 +111,125 @@ def get_prayers():
     status = {r["name"]: r["status"] for r in rows}
     return {n: status.get(n, 0) for n in names}
 
+def get_expense_breakdown():
+    today = now().date().isoformat()
+    with db() as c:
+        rows = c.execute("SELECT category, SUM(amount) as total FROM expenses WHERE date(ts)=? GROUP BY category", (today,)).fetchall()
+    
+    if not rows: return "لا توجد مصاريف اليوم.", 0
+    
+    rate = get_rate()
+    total_sar = sum(r["total"] for r in rows)
+    lines = []
+    emojis = {"أكل": "🍔", "دخان": "🚬", "سناكات": "🍫", "بقالة": "🛒", "مواصلات": "🚗", "أخرى": "📦", "تحويل السودان": "🇸🇩", "سداد دين طويل": "🏦"}
+    
+    for r in sorted(rows, key=lambda x: x["total"], reverse=True):
+        cat = r["category"]
+        amt = r["total"]
+        pct = (amt / total_sar) * 100
+        sdg = amt * rate
+        emoji = emojis.get(cat, "📌")
+        lines.append(f"{emoji} {cat}: {amt:.0f} ر.س ({sdg:,.0f} ج.س) | {pct:.0f}%")
+    
+    return "\n".join(lines), total_sar
+
+def get_cumulative_stats():
+    rate = get_rate()
+    with db() as c:
+        # 1. الدخان (سجائر + أي مصاريف دخان يدوية)
+        cigs_count = c.execute("SELECT COUNT(*) c FROM cigarettes").fetchone()["c"]
+        cig_manual = c.execute("SELECT SUM(amount) s FROM expenses WHERE category='دخان'").fetchone()["s"] or 0
+        smoke_tot = (cigs_count * PRICE_PER_CIG) + cig_manual
+        
+        # 2. البقالة
+        grocery_tot = c.execute("SELECT SUM(amount) s FROM expenses WHERE category='بقالة'").fetchone()["s"] or 0
+        
+        # 3. ديون آجلة (المسجلة كآجل في اليومية + الديون طويلة الأجل)
+        deferred_tot = c.execute("SELECT SUM(amount) s FROM expenses WHERE ptype='credit'").fetchone()["s"] or 0
+        long_tot = c.execute("SELECT SUM(total_sar) s FROM long_debts").fetchone()["s"] or 0
+        deferred_tot += long_tot
+        
+        # 4. مستحق السودان (إجمالي المدفوعات الفعلية)
+        sudan_tot = c.execute("SELECT SUM(paid_sar) s FROM sudan_pays").fetchone()["s"] or 0
+        
+        # 5. أخرى (كل المصاريف النقدية عدا البقالة والسودان وطويلة الأجل)
+        other_tot = c.execute("""
+            SELECT SUM(amount) s FROM expenses 
+            WHERE ptype='cash' 
+            AND category NOT IN ('بقالة', 'تحويل السودان', 'سداد دين طويل')
+        """).fetchone()["s"] or 0
+
+    grand_total = smoke_tot + grocery_tot + sudan_tot + deferred_tot + other_tot
+    
+    if grand_total == 0:
+        return "لا توجد مصاريف تراكمية حتى الآن."
+
+    def fmt(name, emoji, amt):
+        pct = (amt / grand_total) * 100
+        sdg = amt * rate
+        return f"{emoji} {name}: {amt:,.0f} ر.س ({sdg:,.0f} ج.س) | {pct:.0f}%"
+
+    lines = [
+        fmt("دخان", "🚬", smoke_tot),
+        fmt("بقالة", "🛒", grocery_tot),
+        fmt("أخرى", "📦", other_tot),
+        fmt("ديون آجلة", "⏳", deferred_tot),
+        fmt("مستحق السودان", "🇸🇩", sudan_tot)
+    ]
+    return "\n".join(lines), grand_total
+
 def dashboard_text():
     ts = cigs_today(); limit = today_limit()
     last = ts[-1].strftime("%I:%M %p") if ts else "—"
     
-    with db() as c:
-        r = c.execute("""SELECT
-            COALESCE(SUM(CASE WHEN ptype='cash' THEN amount END),0) cash,
-            COALESCE(SUM(CASE WHEN ptype='credit' THEN amount END),0) credit
-            FROM expenses WHERE date(ts)=?""", (now().date().isoformat(),)).fetchone()
-    cash, credit = r["cash"], r["credit"]
-    
     wallet = get_wallet_balance()
     rate = get_rate()
+    
+    breakdown_text, today_total = get_expense_breakdown()
+    today_total_sdg = today_total * rate
+    
+    cum_text, cum_total = get_cumulative_stats()
+    cum_total_sdg = cum_total * rate
     
     with db() as c:
         sudan_req = c.execute("SELECT SUM(amount_sdg) s FROM sudan_reqs").fetchone()["s"] or 0
         sudan_paid = c.execute("SELECT SUM(paid_sdg) s FROM sudan_pays").fetchone()["s"] or 0
-        sudan_rem_sar = (sudan_req - sudan_paid) / rate
+        sudan_rem_sdg = sudan_req - sudan_paid
+        sudan_rem_sar = sudan_rem_sdg / rate
         
         long_total = c.execute("SELECT SUM(total_sar) s FROM long_debts").fetchone()["s"] or 0
         long_paid = c.execute("SELECT SUM(paid_sar) s FROM long_debts").fetchone()["s"] or 0
         long_rem_sar = long_total - long_paid
+        long_rem_sdg = long_rem_sar * rate
 
     prayers = get_prayers()
     p_text = " ".join([f"{'✅' if v else '⬜'} {k}" for k, v in prayers.items()])
     next_cig = get_next_cig_time()
+    due_date = get_end_of_month()
 
     return (
         f"📅 *{now().strftime('%A %d %B %Y | %I:%M %p')}*\n"
+        f"💱 *سعر الصرف اليوم:* 1 ر.س = {rate} ج.س\n"
         f"━━━━━━━━━━━━━━━\n"
         f"📈 *المحفظة المالية*\n"
-        f"💵 *الرصيد المتاح: {wallet:.2f} ر.س*\n"
+        f"💵 *الرصيد المتاح: {wallet:,.2f} ر.س*\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"💰 *حركة اليوم:*\n"
-        f"💵 نقداً: {cash:.0f} ر.س ┃ 💳 آجلاً: {credit:.0f} ر.س\n"
+        f"💰 *مصاريف اليوم:*\n"
+        f"💵 *الإجمالي: {today_total:.0f} ر.س ({today_total_sdg:,.0f} ج.س)*\n"
+        f"📊 *التفصيل:*\n{breakdown_text}\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🚬 *التدخين:* {len(ts)} / {limit}\n"
         f"⏱️ آخر: {last} ┃ ⏳ القادمة: *{next_cig}*\n"
         f"━━━━━━━━━━━━━━━\n"
         f"🕌 *الصلوات:*\n{p_text}\n"
         f"━━━━━━━━━━━━━━━\n"
-        f"💼 *المصاريف المستحقة:*\n"
-        f"🇸🇩 السودان: {sudan_rem_sar:.2f} ر.س\n"
-        f"⏳ طويلة الأجل: {long_rem_sar:.2f} ر.س\n"
+        f"💼 *المصاريف المستحقة (استحقاق: {due_date}):*\n"
+        f"🇸🇩 السودان: {sudan_rem_sar:,.0f} ر.س ({sudan_rem_sdg:,.0f} ج.س)\n"
+        f"⏳ طويلة الأجل: {long_rem_sar:,.0f} ر.س ({long_rem_sdg:,.0f} ج.س)\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"📈 *التراكمي الكلي للمصاريف:*\n"
+        f"*(الإجمالي: {cum_total:,.0f} ر.س / {cum_total_sdg:,.0f} ج.س)*\n"
+        f"{cum_text}\n"
     )
 
 def main_kb():
@@ -157,7 +239,8 @@ def main_kb():
          InlineKeyboardButton("💰 إضافة مصروف", callback_data="add_exp_btn")],
         [InlineKeyboardButton("➕ إضافة إيراد", callback_data="add_inc_btn"),
          InlineKeyboardButton("✏️ إدارة وتصحيح", callback_data="edit_menu")],
-        [InlineKeyboardButton("💼 المصاريف المستحقة", callback_data="accrued_menu")],
+        [InlineKeyboardButton("💼 المصاريف المستحقة", callback_data="accrued_menu"),
+         InlineKeyboardButton("💱 تعديل سعر الصرف", callback_data="edit_rate_btn")],
         [InlineKeyboardButton(f"{'✅' if prayers['الفجر'] else '⬜'} الفجر", callback_data="pr|الفجر"),
          InlineKeyboardButton(f"{'✅' if prayers['الظهر'] else '⬜'} الظهر", callback_data="pr|الظهر"),
          InlineKeyboardButton(f"{'✅' if prayers['العصر'] else '⬜'} العصر", callback_data="pr|العصر")],
@@ -167,14 +250,13 @@ def main_kb():
     ])
 
 def accrued_menu_kb():
-    rate = get_rate()
-    kb = [
+    due_date = get_end_of_month()
+    return InlineKeyboardMarkup([
         [InlineKeyboardButton("🇸🇩 مستحقات السودان (بالجنيه)", callback_data="menu_sudan")],
         [InlineKeyboardButton("⏳ ديون طويلة الأجل (بالريال)", callback_data="menu_long")],
-        [InlineKeyboardButton(f"💱 تعديل سعر الصرف (حالياً {rate})", callback_data="edit_rate_btn")],
+        [InlineKeyboardButton(f"📅 تاريخ الاستحقاق: {due_date}", callback_data="noop")],
         [InlineKeyboardButton("🔙 رجوع للوحة", callback_data="refresh")]
-    ]
-    return InlineKeyboardMarkup(kb)
+    ])
 
 def sudan_menu_kb():
     rate = get_rate()
@@ -189,7 +271,6 @@ def sudan_menu_kb():
     for r in sudan:
         rem_sdg = r["amount_sdg"] - r["paid_sdg"]
         rem_sar = rem_sdg / rate
-        # Display name and amount
         kb.append([InlineKeyboardButton(f"👤 {r['name']} - {rem_sdg:,.0f} ج.س ({rem_sar:,.0f} ر.س)", callback_data="noop")])
         kb.append([
             InlineKeyboardButton("💸 دفع", callback_data=f"sd_pay|{r['name']}"),
@@ -400,13 +481,12 @@ async def sd_pay_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ تم تحويل {paid_sdg:,.0f} ج.س ({paid_sar:,.2f} ر.س).", reply_markup=main_kb())
     return ConversationHandler.END
 
-# ================== SUDAN DELETE CONV ==================
+# ================== SUDAN DELETE ==================
 async def sd_del_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     name = q.data.split("|")[1]
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚠️ نعم، احذف", callback_data=f"sd_del_confirm|{name}")], [InlineKeyboardButton("🔙 إلغاء", callback_data="menu_sudan")]])
     await q.edit_message_text(f"هل أنت متأكد من حذف *{name}* بالكامل؟\n(سيتم حذف سجل الدفعات أيضاً)", parse_mode="Markdown", reply_markup=kb)
-    return ConversationHandler.END # Using callback directly
 
 async def sd_del_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -470,13 +550,12 @@ async def ld_pay_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ تم تسجيل السداد بنجاح.", reply_markup=main_kb())
     return ConversationHandler.END
 
-# ================== LONG DELETE CONV ==================
+# ================== LONG DELETE ==================
 async def ld_del_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     id_ = q.data.split("|")[1]
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("⚠️ نعم، احذف", callback_data=f"ld_del_confirm|{id_}")], [InlineKeyboardButton("🔙 إلغاء", callback_data="menu_long")]])
     await q.edit_message_text("هل أنت متأكد من حذف هذا الدين بالكامل؟", reply_markup=kb)
-    return ConversationHandler.END
 
 async def ld_del_confirm(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
@@ -566,7 +645,6 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
     
-    # Defining all Conversations
     convs = [
         ConversationHandler(entry_points=[CallbackQueryHandler(add_exp_start, pattern="^add_exp_btn$"), CommandHandler("expense", add_exp_start)],
                             states={EXP_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, exp_amount)],
@@ -585,42 +663,34 @@ if __name__ == "__main__":
                             states={RATE_INPUT: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_rate)]},
                             fallbacks=[CommandHandler("cancel", cancel)]),
                             
-        # Sudan Add
         ConversationHandler(entry_points=[CallbackQueryHandler(sd_add_start, pattern="^sd_add$")],
                             states={SD_ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, sd_add_name)],
                                     SD_ADD_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sd_add_amt)]},
                             fallbacks=[CommandHandler("cancel", cancel)]),
                             
-        # Sudan Edit
         ConversationHandler(entry_points=[CallbackQueryHandler(sd_edit_start, pattern="^sd_edit\\|")],
                             states={SD_EDIT_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sd_edit_amt)]},
                             fallbacks=[CommandHandler("cancel", cancel)]),
                             
-        # Sudan Pay
         ConversationHandler(entry_points=[CallbackQueryHandler(sd_pay_start, pattern="^sd_pay\\|")],
                             states={SD_PAY_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sd_pay_amt)]},
                             fallbacks=[CommandHandler("cancel", cancel)]),
                             
-        # Sudan Delete Confirm Handler (Inline)
         CallbackQueryHandler(sd_del_start, pattern="^sd_del\\|"),
         
-        # Long Add
         ConversationHandler(entry_points=[CallbackQueryHandler(ld_add_start, pattern="^ld_add$")],
                             states={LD_ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ld_add_name)],
                                     LD_ADD_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ld_add_amt)]},
                             fallbacks=[CommandHandler("cancel", cancel)]),
                             
-        # Long Edit
         ConversationHandler(entry_points=[CallbackQueryHandler(ld_edit_start, pattern="^ld_edit\\|")],
                             states={LD_EDIT_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ld_edit_amt)]},
                             fallbacks=[CommandHandler("cancel", cancel)]),
                             
-        # Long Pay
         ConversationHandler(entry_points=[CallbackQueryHandler(ld_pay_start, pattern="^ld_pay\\|")],
                             states={LD_PAY_AMT: [MessageHandler(filters.TEXT & ~filters.COMMAND, ld_pay_amt)]},
                             fallbacks=[CommandHandler("cancel", cancel)]),
                             
-        # Long Delete Confirm Handler (Inline)
         CallbackQueryHandler(ld_del_start, pattern="^ld_del\\|"),
     ]
 
