@@ -81,12 +81,7 @@ def get_setting(key, default=None):
         return float(row["value"]) if row else default
 
 def get_rate(): return get_setting('exchange_rate', 140.0)
-
-def get_daily_target():
-    target = get_setting('daily_target', 12.0)
-    # Auto-reduction logic: reduce by 1 every 7 days if desired, but user can override.
-    # For now, let's just use the manual variable to keep it simple and accurate as requested.
-    return int(target)
+def get_daily_target(): return int(get_setting('daily_target', 12.0))
 
 def get_next_cig_time():
     sched = SCHEDULE_FRIDAY if now().weekday() == 4 else SCHEDULE_NORMAL
@@ -124,7 +119,6 @@ def get_next_prayer_al_qurayyat():
         res = requests.get(url, timeout=5).json()
         timings = res['data']['timings']
         
-        # Clean times (sometimes API returns "03:15 (AST)")
         prayer_times = {
             "الفجر": timings["Fajr"].split(" ")[0],
             "الظهر": timings["Dhuhr"].split(" ")[0],
@@ -136,7 +130,6 @@ def get_next_prayer_al_qurayyat():
         current_time = now().strftime("%H:%M")
         for p_name, p_time in prayer_times.items():
             if p_time > current_time:
-                # calculate remaining
                 fmt = "%H:%M"
                 t1 = datetime.strptime(current_time, fmt)
                 t2 = datetime.strptime(p_time, fmt)
@@ -148,7 +141,6 @@ def get_next_prayer_al_qurayyat():
                 if hours > 0: rem_str += f"{hours} س و "
                 rem_str += f"{minutes} د"
                 
-                # convert to 12h format
                 t_obj = datetime.strptime(p_time, fmt)
                 p_12 = t_obj.strftime("%I:%M %p")
                 
@@ -187,7 +179,10 @@ def get_cumulative_stats():
         other_tot = c.execute("SELECT SUM(amount) s FROM expenses WHERE ptype='cash' AND category NOT IN ('بقالة', 'تحويل السودان', 'سداد دين طويل')").fetchone()["s"] or 0
 
     grand_total = smoke_tot + grocery_tot + sudan_tot + deferred_tot + other_tot
-    if grand_total == 0: return "لا توجد مصاريف تراكمية حتى الآن."
+    
+    # إصلاح المشكلة: إرجاع قيمتين دائماً (نص ورقم)
+    if grand_total == 0: 
+        return "لا توجد مصاريف تراكمية حتى الآن.", 0
 
     def fmt(name, emoji, amt):
         return f"{emoji} {name}: {amt:,.0f} ر.س ({amt*rate:,.0f} ج.س) | {(amt/grand_total)*100:.0f}%"
@@ -198,7 +193,6 @@ def get_cumulative_stats():
 def dashboard_text():
     ts = cigs_today(); target = get_daily_target()
     
-    # Smoking Stats
     smoked = len(ts)
     remaining = max(0, target - smoked)
     compliance_pct = (remaining / target) * 100 if target > 0 else 0
@@ -422,7 +416,7 @@ async def save_limit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ تم تحديث السقف إلى {limit} سيجارة.\n\n" + dashboard_text(), parse_mode="Markdown", reply_markup=main_kb())
     return ConversationHandler.END
 
-# (Sudan & Long Debt Conversations remain same as previous code)
+# (Sudan & Long Debt Conversations)
 async def sd_add_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     await q.edit_message_text("🇸🇩 *إضافة مستفيد للسودان*\nأرسل اسم الشخص:")
