@@ -45,12 +45,6 @@ def now():
 def get_ts():
     return now().strftime("%Y-%m-%d %H:%M:%S")
 
-def get_end_of_month():
-    today = now().date()
-    last_day = calendar.monthrange(today.year, today.month)[1]
-    month_names = ["يناير", "فبراير", "مارس", "أبريل", "مايو", "يونيو", "يوليو", "أغسطس", "سبتمبر", "أكتوبر", "نوفمبر", "ديسمبر"]
-    return f"{last_day} {month_names[today.month-1]}"
-
 def db():
     c = sqlite3.connect(DB); c.row_factory = sqlite3.Row; return c
 
@@ -91,21 +85,16 @@ def get_next_cig_time():
     remaining = max(0, target - smoked)
     if remaining <= 1: return "انتهى السقف اليومي"
 
-    # أوقات اليقظة: 8:30ص - 2:00م، و 5:00م - 2:00ص
     wake_1 = t.replace(hour=8, minute=30, second=0, microsecond=0)
     sleep_1 = t.replace(hour=14, minute=0, second=0, microsecond=0)
     wake_2 = t.replace(hour=17, minute=0, second=0, microsecond=0)
     sleep_2 = t.replace(hour=2, minute=0, second=0, microsecond=0) + timedelta(days=1)
-    
-    # أول سيجارة الساعة 9 ص لتجنب الريق
     first_cig_time = t.replace(hour=9, minute=0, second=0, microsecond=0)
     
     current = t
 
-    if current < wake_1:
-        return "09:00 ص"
-    if current < first_cig_time and smoked == 0:
-        return "09:00 ص"
+    if current < wake_1: return "09:00 ص"
+    if current < first_cig_time and smoked == 0: return "09:00 ص"
     
     if wake_1 <= current < sleep_1:
         rem_mins_1 = (sleep_1 - current).total_seconds() / 60
@@ -114,16 +103,13 @@ def get_next_cig_time():
     elif wake_2 <= current < sleep_2:
         total_awake_mins = (sleep_2 - current).total_seconds() / 60
     else:
-        return "05:00 م" # فترة النوم
+        return "05:00 م"
 
     gap = total_awake_mins / remaining
     next_time = current + timedelta(minutes=gap)
     
-    if sleep_1 <= next_time <= wake_2:
-        next_time = wake_2
-        
-    if next_time > sleep_2:
-         return "غداً 09:00 ص"
+    if sleep_1 <= next_time <= wake_2: next_time = wake_2
+    if next_time > sleep_2: return "غداً 09:00 ص"
 
     return next_time.strftime("%I:%M %p").replace("AM", "ص").replace("PM", "م")
 
@@ -173,15 +159,39 @@ def get_next_prayer_al_qurayyat():
 
 def get_debt_summary():
     with db() as c:
-        # قصيرة الأجل (غير مدفوعة)
         short_term = c.execute("SELECT COALESCE(SUM(amount),0) s FROM expenses WHERE ptype='credit' AND paid=0").fetchone()["s"]
-        # طويلة الأجل (مجموع الأقساط المستحقة فقط)
         long_term_installments = c.execute("SELECT COALESCE(SUM(installment_sar),0) s FROM long_debts WHERE total_sar > paid_sar").fetchone()["s"]
-        
-        # ديون السيجارة الآجلة
         cig_debts = c.execute("SELECT COALESCE(SUM(cost),0) s FROM cigarettes WHERE cig_type='credit'").fetchone()["s"]
         
     return short_term + long_term_installments + cig_debts, short_term + cig_debts, long_term_installments
+
+def get_detailed_debt_report():
+    with db() as c:
+        # ديون المصاريف الآجلة
+        exp_debts = c.execute("SELECT v.name, SUM(e.amount) as amt FROM expenses e JOIN vendors v ON e.vendor_id=v.id WHERE e.ptype='credit' AND e.paid=0 GROUP BY v.id").fetchall()
+        # ديون السجائر الآجلة
+        cig_debts = c.execute("SELECT v.name, SUM(cig.cost) as amt FROM cigarettes cig JOIN vendors v ON cig.vendor_id=v.id WHERE cig.cig_type='credit' GROUP BY v.id").fetchall()
+        # الديون طويلة الأجل
+        long_debts = c.execute("SELECT name, total_sar, installment_sar, paid_sar FROM long_debts WHERE total_sar > paid_sar").fetchall()
+        
+    short_dict = {}
+    for r in exp_debts: short_dict[r["name"]] = short_dict.get(r["name"], 0) + r["amt"]
+    for r in cig_debts: short_dict[r["name"]] = short_dict.get(r["name"], 0) + r["amt"]
+        
+    text = "📉 *تقرير الديون المفصل*\n"
+    text += "━━━━━━━━━━━━━━━━━━━━━\n"
+    text += "🔴 *الديون قصيرة الأجل:*\n"
+    if not short_dict: text += "لا توجد ديون قصيرة الأجل.\n"
+    else:
+        for name, amt in short_dict.items(): text += f"• {name}: {amt:,.0f} ر.س\n"
+            
+    text += "\n🟡 *الديون طويلة الأجل (أقساط):*\n"
+    if not long_debts: text += "لا توجد ديون طويلة الأجل.\n"
+    else:
+        for r in long_debts:
+            rem = r["total_sar"] - r["paid_sar"]
+            text += f"• {r['name']}: المتبقي {rem:,.0f} ر.س | القسط {r['installment_sar']:,.0f} ر.س\n"
+    return text
 
 def get_expense_breakdown(period="month"):
     with db() as c:
@@ -194,20 +204,15 @@ def get_expense_breakdown(period="month"):
             rows = c.execute("SELECT category, SUM(amount) as total FROM expenses GROUP BY category").fetchall()
             cig_cash = c.execute("SELECT SUM(cost) s FROM cigarettes WHERE cig_type='cash'").fetchone()["s"] or 0
             
-    if rows:
-        rows = [dict(r) for r in rows]
-    else:
-        rows = []
+    if rows: rows = [dict(r) for r in rows]
+    else: rows = []
         
     if cig_cash > 0:
         found = False
         for r in rows:
             if r["category"] == "دخان":
-                r["total"] += cig_cash
-                found = True
-                break
-        if not found:
-            rows.append({"category": "دخان", "total": cig_cash})
+                r["total"] += cig_cash; found = True; break
+        if not found: rows.append({"category": "دخان", "total": cig_cash})
             
     total_sar = sum(r["total"] for r in rows)
     if total_sar == 0: return "لا توجد بيانات.", 0
@@ -225,9 +230,7 @@ def dashboard_text():
     next_cig = get_next_cig_time()
     wallet = get_wallet_balance()
     rate = get_rate()
-    
     total_debt, short_debt, long_installments = get_debt_summary()
-
     prayers = get_prayers()
     p_icons = " ".join([f"{'✅' if v else '⬜'} {k}" for k, v in prayers.items()])
     next_prayer_text = get_next_prayer_al_qurayyat()
@@ -272,7 +275,7 @@ def report_menu_kb():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🧾 بيان المصروفات (هذا الشهر)", callback_data="rep_expenses_month")],
         [InlineKeyboardButton("📈 التقرير الشهري الشامل", callback_data="rep_month")],
-        [InlineKeyboardButton("📉 تقرير الديون", callback_data="rep_debts")],
+        [InlineKeyboardButton("📉 تقرير الديون", callback_data="show_debts")],
         [InlineKeyboardButton("🚬 تقرير التدخين", callback_data="rep_cigs")],
         [InlineKeyboardButton("🔄 ترحيل الرصيد للشهر القادم", callback_data="do_rollover")],
         [InlineKeyboardButton("🔙 رجوع", callback_data="refresh")]
@@ -291,8 +294,7 @@ def vendor_menu_kb():
     with db() as c:
         rows = c.execute("SELECT id, name FROM vendors").fetchall()
     kb = []
-    for r in rows:
-        kb.append([InlineKeyboardButton(f"🏪 {r['name']}", callback_data=f"vendor_view|{r['id']}")])
+    for r in rows: kb.append([InlineKeyboardButton(f"🏪 {r['name']}", callback_data=f"vendor_view|{r['id']}")])
     kb.append([InlineKeyboardButton("➕ إضافة جهة جديدة", callback_data="add_vendor")])
     kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="debt_menu")])
     return InlineKeyboardMarkup(kb)
@@ -310,8 +312,11 @@ async def add_exp_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return EXP_AMOUNT
 
 async def exp_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try: ctx.user_data["amount"] = float(update.message.text.strip())
-    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
+    try: 
+        amt = float(update.message.text.strip())
+        if amt <= 0: raise ValueError
+        ctx.user_data["amount"] = amt
+    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً صحيحاً أكبر من صفر.")
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("أكل", callback_data="cat|أكل"), InlineKeyboardButton("بقالة", callback_data="cat|بقالة"), InlineKeyboardButton("منظفات", callback_data="cat|منظفات")],
         [InlineKeyboardButton("مواصلات", callback_data="cat|مواصلات"), InlineKeyboardButton("دخان", callback_data="cat|دخان"), InlineKeyboardButton("أخرى", callback_data="cat|أخرى")]
@@ -330,14 +335,12 @@ async def exp_ptype(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     ptype = q.data.split("|",1)[1]
     if ptype == "cash":
-        with db() as c:
-            c.execute("INSERT INTO expenses(ts,amount,category,ptype,paid) VALUES(?,?,?,?,1)", (get_ts(), ctx.user_data["amount"], ctx.user_data["category"], "cash"))
+        with db() as c: c.execute("INSERT INTO expenses(ts,amount,category,ptype,paid) VALUES(?,?,?,?,1)", (get_ts(), ctx.user_data["amount"], ctx.user_data["category"], "cash"))
         await q.edit_message_text("✅ تم تسجيل المصروف النقدي.", reply_markup=main_kb())
         return ConversationHandler.END
     
     ctx.user_data["ptype"] = "credit"
-    with db() as c:
-        rows = c.execute("SELECT id, name FROM vendors").fetchall()
+    with db() as c: rows = c.execute("SELECT id, name FROM vendors").fetchall()
     if not rows:
         await q.edit_message_text("⚠️ لا توجد جهات مسجلة. يرجى إضافتها من إدارة الديون أولاً.", reply_markup=main_kb())
         return ConversationHandler.END
@@ -349,8 +352,7 @@ async def exp_ptype(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def exp_vendor(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     vid = q.data.split("|")[1]
-    with db() as c:
-        c.execute("INSERT INTO expenses(ts,amount,category,ptype,vendor_id,paid) VALUES(?,?,?,?,?,0)", (get_ts(), ctx.user_data["amount"], ctx.user_data["category"], "credit", vid))
+    with db() as c: c.execute("INSERT INTO expenses(ts,amount,category,ptype,vendor_id,paid) VALUES(?,?,?,?,?,0)", (get_ts(), ctx.user_data["amount"], ctx.user_data["category"], "credit", vid))
     await q.edit_message_text("✅ تم تسجيل المصروف الآجل.", reply_markup=main_kb())
     return ConversationHandler.END
 
@@ -364,8 +366,11 @@ async def add_inc_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return INC_AMOUNT
 
 async def inc_amount(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try: ctx.user_data["inc_amount"] = float(update.message.text.strip())
-    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
+    try: 
+        amt = float(update.message.text.strip())
+        if amt <= 0: raise ValueError
+        ctx.user_data["inc_amount"] = amt
+    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً صحيحاً أكبر من صفر.")
     await update.message.reply_text("📝 اكتب مصدر الإيراد (مثال: راتب):")
     return INC_SOURCE
 
@@ -377,6 +382,10 @@ async def inc_source(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ================== CIGARETTE ==================
 async def cig_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
+    target = get_daily_target()
+    if len(cigs_today()) >= target:
+        await q.answer("⚠️ وصلت السقف اليومي!", show_alert=True); return ConversationHandler.END
+        
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("💵 نقدي (من جيبي)", callback_data="cig_type|cash")],
         [InlineKeyboardButton("📝 آجل (على الحساب)", callback_data="cig_type|credit")],
@@ -399,9 +408,7 @@ async def cig_type(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("✅ تم التسجيل مجاناً.\n\n" + dashboard_text(), parse_mode="Markdown", reply_markup=main_kb())
         return ConversationHandler.END
         
-    # Credit
-    with db() as c:
-        rows = c.execute("SELECT id, name FROM vendors").fetchall()
+    with db() as c: rows = c.execute("SELECT id, name FROM vendors").fetchall()
     if not rows:
         await q.edit_message_text("⚠️ لا توجد جهات مسجلة.", reply_markup=main_kb())
         return ConversationHandler.END
@@ -440,14 +447,19 @@ async def ld_add_name(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return LD_ADD_AMT
 
 async def ld_add_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try: ctx.user_data["ld_amt"] = float(update.message.text.strip())
-    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
+    try: 
+        amt = float(update.message.text.strip())
+        if amt <= 0: raise ValueError
+        ctx.user_data["ld_amt"] = amt
+    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً صحيحاً أكبر من صفر.")
     await update.message.reply_text("أرسل مبلغ القسط المستحق حالياً (بالريال):")
     return LD_ADD_INSTALLMENT
 
 async def ld_add_installment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try: inst = float(update.message.text.strip())
-    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
+    try: 
+        inst = float(update.message.text.strip())
+        if inst <= 0: raise ValueError
+    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً صحيحاً أكبر من صفر.")
     with db() as c: c.execute("INSERT INTO long_debts(name, total_sar, installment_sar) VALUES(?,?,?)", (ctx.user_data["ld_name"], ctx.user_data["ld_amt"], inst))
     await update.message.reply_text("✅ تم الإضافة.", reply_markup=debt_menu_kb())
     return ConversationHandler.END
@@ -465,10 +477,8 @@ async def pay_debt_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         long_debts = c.execute("SELECT id, name, installment_sar FROM long_debts WHERE total_sar > paid_sar").fetchall()
         
     kb = []
-    for r in vendors_debts:
-        kb.append([InlineKeyboardButton(f"🏪 {r['name']} - {r['tot']:.0f} ر.س", callback_data=f"p_debt_v|{r['id']}")])
-    for r in long_debts:
-        kb.append([InlineKeyboardButton(f"⏳ {r['name']} - قسط {r['installment_sar']:.0f} ر.س", callback_data=f"p_debt_l|{r['id']}")])
+    for r in vendors_debts: kb.append([InlineKeyboardButton(f"🏪 {r['name']} - {r['tot']:.0f} ر.س", callback_data=f"p_debt_v|{r['id']}")])
+    for r in long_debts: kb.append([InlineKeyboardButton(f"⏳ {r['name']} - قسط {r['installment_sar']:.0f} ر.س", callback_data=f"p_debt_l|{r['id']}")])
         
     kb.append([InlineKeyboardButton("🔙 رجوع", callback_data="debt_menu")])
     await q.edit_message_text("💸 اختر الدين الذي تريد سداده:", reply_markup=InlineKeyboardMarkup(kb))
@@ -480,28 +490,24 @@ async def pay_debt_amt_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     dtype, did = data[0], data[1]
     
     if dtype == "p_debt_v":
-        ctx.user_data["pay_type"] = "vendor"
-        ctx.user_data["pay_id"] = did
+        ctx.user_data["pay_type"] = "vendor"; ctx.user_data["pay_id"] = did
         await q.edit_message_text("💸 كم تريد أن تسدد لهذه الجهة؟ (أرسل المبلغ):")
     else:
-        ctx.user_data["pay_type"] = "long"
-        ctx.user_data["pay_id"] = did
+        ctx.user_data["pay_type"] = "long"; ctx.user_data["pay_id"] = did
         await q.edit_message_text("💸 كم تريد أن تسدد من القسط؟ (أرسل المبلغ):")
-        
     return PAY_DEBT_AMT
 
 async def pay_debt_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try: amt = float(update.message.text.strip())
-    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
+    try: 
+        amt = float(update.message.text.strip())
+        if amt <= 0: raise ValueError
+    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً صحيحاً أكبر من صفر.")
     
-    ptype = ctx.user_data["pay_type"]
-    pid = ctx.user_data["pay_id"]
+    ptype = ctx.user_data["pay_type"]; pid = ctx.user_data["pay_id"]
     
     with db() as c:
         if ptype == "vendor":
-            # تحديث المصاريف الآجلة
             remaining = amt
-            # 1. سداد مصاريف
             rows = c.execute("SELECT id, amount FROM expenses WHERE vendor_id=? AND ptype='credit' AND paid=0 ORDER BY id ASC", (pid,)).fetchall()
             for r in rows:
                 if remaining <= 0: break
@@ -509,18 +515,17 @@ async def pay_debt_amt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 if deduct == r["amount"]: c.execute("UPDATE expenses SET paid=1 WHERE id=?", (r["id"],))
                 else: c.execute("UPDATE expenses SET amount = amount - ? WHERE id=?", (deduct, r["id"]))
                 remaining -= deduct
-            # 2. سداد سجائر آجلة
+            
             cigs = c.execute("SELECT id, cost FROM cigarettes WHERE vendor_id=? AND cig_type='credit' ORDER BY id ASC", (pid,)).fetchall()
             for r in cigs:
                 if remaining <= 0: break
                 deduct = min(r["cost"], remaining)
-                if deduct == r["cost"]: c.execute("DELETE FROM cigarettes WHERE id=?", (r["id"],)) # تحويلها لمصاريف نقدية
+                if deduct == r["cost"]: c.execute("DELETE FROM cigarettes WHERE id=?", (r["id"],))
                 else: c.execute("UPDATE cigarettes SET cost = cost - ? WHERE id=?", (deduct, r["id"]))
                 remaining -= deduct
         else:
             c.execute("UPDATE long_debts SET paid_sar = paid_sar + ? WHERE id=?", (amt, pid))
             
-        # تسجيل السداد كمصروف نقدي
         c.execute("INSERT INTO expenses(ts, amount, category, ptype, paid) VALUES(?,?,?,?,1)", (get_ts(), amt, "سداد ديون", "cash"))
 
     await update.message.reply_text("✅ تم تسجيل السداد وخصمه من المحفظة.", reply_markup=main_kb())
@@ -533,8 +538,10 @@ async def edit_rate_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return RATE_INPUT
 
 async def save_rate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try: rate = float(update.message.text.strip())
-    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
+    try: 
+        rate = float(update.message.text.strip())
+        if rate <= 0: raise ValueError
+    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً صحيحاً أكبر من صفر.")
     with db() as c: c.execute("UPDATE settings SET value=? WHERE key='exchange_rate'", (str(rate),))
     await update.message.reply_text("✅ تم تحديث السعر.", reply_markup=main_kb())
     return ConversationHandler.END
@@ -545,8 +552,10 @@ async def edit_limit_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     return LIMIT_INPUT
 
 async def save_limit(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try: limit = int(update.message.text.strip())
-    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً صحيحاً فقط.")
+    try: 
+        limit = int(update.message.text.strip())
+        if limit <= 0: raise ValueError
+    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً صحيحاً أكبر من صفر.")
     with db() as c: c.execute("UPDATE settings SET value=? WHERE key='daily_target'", (str(limit),))
     await update.message.reply_text("✅ تم تحديث السقف.", reply_markup=main_kb())
     return ConversationHandler.END
@@ -559,28 +568,23 @@ async def rep_expenses(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = f"🧾 *بيان مصروفات الشهر:*\n💵 الإجمالي: {total:,.0f} ر.س ({total*rate:,.0f} ج.س)\n\n{text}"
     await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=report_menu_kb())
 
-async def rep_debts(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query; await q.answer()
-    total_debt, short_debt, long_installments = get_debt_summary()
-    rate = get_rate()
-    msg = (
-        f"📉 *تقرير الديون:*\n"
-        f"🔴 *إجمالي الالتزامات:* {total_debt:,.0f} ر.س ({total_debt*rate:,.0f} ج.س)\n\n"
-        f"• قصيرة الأجل: {short_debt:,.0f} ر.س\n"
-        f"• أقساط طويلة الأجل: {long_installments:,.0f} ر.س"
-    )
-    await q.edit_message_text(msg, parse_mode="Markdown", reply_markup=report_menu_kb())
-
 # ================== ROLLOVER ==================
 async def rollover_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query; await q.answer()
     wallet = get_wallet_balance()
+    if wallet <= 0:
+        await q.edit_message_text("⚠️ رصيدك الحالي صفر أو سالب، لا يوجد رصيد لترحيله.", reply_markup=main_kb())
+        return ConversationHandler.END
+    
     await q.edit_message_text(f"🔄 *الترحيل للشهر القادم*\nرصيدك الحالي هو {wallet:,.2f} ر.س.\nكم تريد أن ترحل كرصيد افتتاحي؟ (أرسل المبلغ):", parse_mode="Markdown")
     return ROLLOVER_CASH
 
 async def rollover_cash(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    try: amt = float(update.message.text.strip())
-    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً فقط.")
+    try: 
+        amt = float(update.message.text.strip())
+        if amt <= 0: raise ValueError
+    except ValueError: return await update.message.reply_text("⚠️ أرسل رقماً صحيحاً أكبر من صفر (أو اضغط إلغاء).")
+    
     with db() as c: c.execute("INSERT INTO incomes(ts, amount, source) VALUES(?,?,?)", (get_ts(), amt, "رصيد افتتاحي مرحل"))
     await update.message.reply_text(f"✅ تم ترحيل {amt:,.2f} ر.س كإيراد جديد للشهر الجديد.", reply_markup=main_kb())
     return ConversationHandler.END
@@ -604,6 +608,10 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == "vendor_menu":
         await q.edit_message_text("🏪 *إدارة الجهات*", parse_mode="Markdown", reply_markup=vendor_menu_kb())
     
+    elif data == "show_debts":
+        report = get_detailed_debt_report()
+        await q.edit_message_text(report, parse_mode="Markdown", reply_markup=debt_menu_kb())
+        
     elif data.startswith("pr|"):
         p_name = data.split("|")[1]
         today = now().date().isoformat()
@@ -639,7 +647,6 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("🧹 *تم مسح كل شيء!*", reply_markup=main_kb())
 
     elif data == "rep_expenses_month": await rep_expenses(update, ctx)
-    elif data == "rep_debts": await rep_debts(update, ctx)
     elif data.startswith("p_debt_"): await pay_debt_amt_start(update, ctx)
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
